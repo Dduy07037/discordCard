@@ -42,7 +42,7 @@ bool RealtimeVp8::openEncoder(QSize size, int fps, int bitrate)
 {
     if (size.width() < 2 || size.height() < 2 || size.width() > 1920 || size.height() > 1080
         || size.width() % 2 || size.height() % 2 || fps < 1 || fps > 60
-        || bitrate < 100000 || bitrate > 5000000) {
+        || bitrate < 100000 || bitrate > 20000000) {
         impl->error = QStringLiteral("Invalid realtime video encoder settings.");
         return false;
     }
@@ -67,9 +67,11 @@ bool RealtimeVp8::openEncoder(QSize size, int fps, int bitrate)
     context->rc_buffer_size = bitrate;
     context->gop_size = fps;
     context->max_b_frames = 0;
+    context->qmin = 4;
+    context->qmax = 48;
     context->thread_count = std::max(1, std::min(4, QThread::idealThreadCount() / 2));
     av_opt_set(context->priv_data, "deadline", "realtime", 0);
-    av_opt_set(context->priv_data, "cpu-used", "8", 0);
+    av_opt_set(context->priv_data, "cpu-used", fps > 30 ? "8" : "6", 0);
     av_opt_set(context->priv_data, "lag-in-frames", "0", 0);
     if (avcodec_open2(context, codec, nullptr) < 0 || !impl->input || !impl->packet) {
         avcodec_free_context(&context);
@@ -138,6 +140,7 @@ QByteArray RealtimeVp8::encode(const QImage &image, bool keyframe)
     const auto fitted = image.size().scaled(rgb.size(), Qt::KeepAspectRatio);
     {
         QPainter painter(&rgb);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
         painter.drawImage(QRect(QPoint((rgb.width() - fitted.width()) / 2,
                                       (rgb.height() - fitted.height()) / 2), fitted), image);
     }

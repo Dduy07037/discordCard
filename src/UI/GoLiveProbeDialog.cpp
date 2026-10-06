@@ -1,4 +1,5 @@
 #include "GoLiveProbeDialog.hpp"
+#include "StreamVideoView.hpp"
 
 #include "Core/Audio/VoiceManager.hpp"
 #include "Core/Audio/AudioPipeline.hpp"
@@ -38,14 +39,15 @@ class ProbeMediaWorker : public QObject
 public:
     ProbeMediaWorker(const QJsonObject &connection, Core::Snowflake accountId,
                      const Core::ProxyConfig &proxy, std::shared_ptr<ProbeFrameMailbox> mailbox,
-                     std::shared_ptr<Core::Media::LatestVideoFrame> captureFrames = {}, int fps = 30)
+                     std::shared_ptr<Core::Media::LatestVideoFrame> captureFrames = {}, int fps = 30,
+                     Core::Media::ScreenShareSettings settings = {})
         : connection(connection), accountId(accountId), proxy(proxy), mailbox(std::move(mailbox)),
-          captureFrames(std::move(captureFrames)), fps(fps) {}
+          captureFrames(std::move(captureFrames)), fps(fps), settings(settings) {}
     void start()
     {
         const bool publisher = connection.value("publisher").toBool();
         if (publisher &&
-            !(captureFrames ? codec.openEncoder(QSize(1280, 720), fps, fps > 30 ? 4500000 : 3000000) : codec.openEncoder())) {
+            !(captureFrames ? codec.openEncoder(settings.resolution, fps, settings.bitrate) : codec.openEncoder())) {
             emit statusChanged(codec.error().isEmpty() ? tr("VP8 decoder unavailable.") : codec.error());
             return;
         }
@@ -57,7 +59,8 @@ public:
         // Reverse-engineered stream MLS group convention. This needs official
         // Discord interoperability verification; never used for normal voice.
         client->configureVideoSession(Core::Snowflake(quint64(rtcServer) - 1), publisher, bool(captureFrames), fps,
-                                     Core::Media::RealtimeVp8::hasDecoder(QStringLiteral("H264")));
+                                     Core::Media::RealtimeVp8::hasDecoder(QStringLiteral("H264")),
+                                     settings.resolution, settings.bitrate);
         connect(client, &Discord::Voice::VoiceClient::videoCodecChanged, this, [this, publisher](const QString &name) {
             if (!publisher && !codec.openDecoder(name)) emit statusChanged(codec.error());
         });
@@ -217,6 +220,7 @@ private:
     QElapsedTimer statsClock;
     quint64 decodedFrames = 0, lastStatsFrames = 0;
     int fps = 30;
+    Core::Media::ScreenShareSettings settings;
     QString failure;
     unsigned frames = 0;
     quint64 toneSample = 0;
@@ -232,7 +236,8 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
 {
     setAttribute(Qt::WA_DeleteOnClose);
     setWindowTitle(tr("Go Live — experimental"));
-    resize(800, 720);
+    setWindowFlags(windowFlags() | Qt::WindowMinMaxButtonsHint);
+    resize(900, 820);
     auto *layout = new QVBoxLayout(this);
     auto *explanation = new QLabel(tr("Watch a stream in your voice channel or share a monitor you select. "
         "Discord interoperability is still being tested. Screen sharing does not include system audio."), this);
@@ -251,10 +256,32 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
     frameRate->addItem(tr("30 FPS (default)"), 30);
     frameRate->addItem(tr("60 FPS"), 60);
     frameRate->setCurrentIndex(1);
-    frameRate->setToolTip(tr("720p. Actual FPS depends on capture, CPU and network speed. Stop sharing before changing."));
+    frameRate->setToolTip(tr("Actual FPS depends on capture, CPU and network speed. Stop sharing before changing."));
     fpsRow->addWidget(frameRate);
     fpsRow->addStretch();
     layout->addLayout(fpsRow);
+    auto *qualityRow = new QHBoxLayout;
+    qualityRow->addWidget(new QLabel(tr("Stream quality"), this));
+    quality = new QComboBox(this);
+    quality->setAccessibleName(tr("Screen sharing quality"));
+    quality->addItem(tr("720p Balanced"), 0);
+    quality->addItem(tr("1080p High"), 1);
+    quality->addItem(tr("1080p Maximum (default)"), 2);
+    quality->setCurrentIndex(2);
+    qualityRow->addWidget(quality);
+    qualityRow->addStretch();
+    layout->addLayout(qualityRow);
+    qualityHint = new QLabel(this);
+    qualityHint->setWordWrap(true);
+    layout->addWidget(qualityHint);
+    const auto updateQualityHint = [this] {
+        const auto choice = Core::Media::ScreenShareSettings::forPreset(quality->currentData().toInt(), frameRate->currentData().toInt());
+        qualityHint->setText(tr("%1 × %2 • target %3 Mbps. Higher quality needs more upload bandwidth and CPU. Stop sharing before changing.")
+            .arg(choice.resolution.width()).arg(choice.resolution.height()).arg(choice.bitrate / 1000000));
+    };
+    connect(quality, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateQualityHint);
+    connect(frameRate, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateQualityHint);
+    updateQualityHint();
     auto *shareButtons = new QHBoxLayout;
     auto *previewButton = new QPushButton(tr("Preview screen"), this);
     share = new QPushButton(tr("Share selected screen"), this);
@@ -324,6 +351,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
         captureFrames = std::make_shared<Core::Media::LatestVideoFrame>();
         captureFrames->push(std::move(image), capturedAt);
         publishingFps = frameRate->currentData().toInt();
+        publishingQuality = Core::Media::ScreenShareSettings::forPreset(quality->currentData().toInt(), publishingFps);
         if (!manager->goLive()->publish()) {
             stopCapture();
             sharingStatus->setText(tr("Could not start sharing. Stop any existing stream first."));
@@ -332,10 +360,13 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
         requestedPublisher = manager->goLive()->publishingKey();
         screens->setEnabled(false);
         frameRate->setEnabled(false);
+        quality->setEnabled(false);
         share->setEnabled(false);
         testCard->setEnabled(false);
         captureTimer->start(qRound(1000.0 / publishingFps));
-        sharingStatus->setText(tr("Capturing %1 • 720p / target %2 FPS").arg(capturedScreen->name()).arg(publishingFps));
+        sharingStatus->setText(tr("Capturing %1 • %2 × %3 / target %4 FPS / %5 Mbps")
+            .arg(capturedScreen->name()).arg(publishingQuality.resolution.width()).arg(publishingQuality.resolution.height())
+            .arg(publishingFps).arg(publishingQuality.bitrate / 1000000));
         publisherStatus->setText(tr("Connecting screen stream…"));
     });
     connect(stopSharing, &QPushButton::clicked, this, [this] {
@@ -365,9 +396,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
     viewerStats->setTextFormat(Qt::PlainText);
     viewerStats->setWordWrap(true);
     layout->addWidget(viewerStats);
-    video = new QLabel(tr("No stream video yet"), this);
-    video->setAlignment(Qt::AlignCenter);
-    video->setMinimumSize(640, 220);
+    video = new StreamVideoView(this);
     layout->addWidget(video, 1);
 
     // Preserve the protocol test source as an explicit developer-only option.
@@ -394,7 +423,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
             if (participant.userId == accountId || !state || !state->selfStream.get()) continue;
             const Core::Audio::StreamKey key{manager->currentGuildId(), manager->currentChannelId(), participant.userId};
             const auto name = nameResolver ? nameResolver(participant.userId) : QString::number(participant.userId);
-            streams->addItem(name, key.toString());
+            streams->addItem(tr("%1 • TRỰC TIẾP").arg(name), key.toString());
         }
         const auto previous = streams->findData(selection);
         if (previous >= 0) streams->setCurrentIndex(previous);
@@ -415,7 +444,6 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
         if (manager) manager->goLive()->stop(requestedViewer);
         requestedViewer.clear();
         video->clear();
-        video->setText(tr("No stream video yet"));
         viewerStats->clear();
     });
     connect(tone, &QCheckBox::toggled, this, [this](bool value) {
@@ -435,8 +463,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
         }
         if (key == requestedViewer && manager->goLive()->watchingKey() != key) {
             requestedViewer.clear();
-            video->clear();
-            video->setText(tr("Stream ended"));
+            video->clear(tr("Stream ended"));
         }
         refresh();
     });
@@ -464,8 +491,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
             image = std::move(viewer.mailbox->image);
             viewer.mailbox->image = {};
         }
-        if (!image.isNull()) video->setPixmap(QPixmap::fromImage(image).scaled(
-            video->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+        if (!image.isNull()) video->setFrame(image);
     });
     render->start();
 }
@@ -512,6 +538,7 @@ void GoLiveProbeDialog::stopCapture()
     captureFrames.reset();
     screens->setEnabled(true);
     frameRate->setEnabled(true);
+    quality->setEnabled(true);
     publisherStats->clear();
     publisherStatus->clear();
     share->setEnabled(manager && manager->isConnected() && screens->count() > 0);
@@ -542,7 +569,7 @@ void GoLiveProbeDialog::openSession(const QString &key, const QJsonObject &conne
     session.mailbox = std::make_shared<ProbeFrameMailbox>();
     session.thread = new QThread(this);
     session.worker = new ProbeMediaWorker(connection, accountId, manager->proxyConfig(), session.mailbox,
-        connection.value("publisher").toBool() ? captureFrames : nullptr, publishingFps);
+        connection.value("publisher").toBool() ? captureFrames : nullptr, publishingFps, publishingQuality);
     session.worker->setTone(tone->isChecked());
     session.worker->setSound(sound->isChecked());
     session.worker->moveToThread(session.thread);

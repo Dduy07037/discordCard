@@ -442,13 +442,16 @@ void VoiceClient::onSessionUpdate(const QJsonObject &data)
     if (!videoPublisher) advertiseVideo();
 }
 
-void VoiceClient::configureVideoSession(Core::Snowflake groupId, bool publisher, bool desktop, int fps, bool h264Decode)
+void VoiceClient::configureVideoSession(Core::Snowflake groupId, bool publisher, bool desktop, int fps,
+                                       bool h264Decode, QSize resolution, int bitrate)
 {
     Q_ASSERT(currentState == State::Disconnected);
     videoSession = true;
     videoPublisher = publisher;
     desktopVideo = desktop;
     videoFps = qBound(15, fps, 60);
+    videoResolution = QSize(qBound(2, resolution.width(), 1920), qBound(2, resolution.height(), 1080));
+    videoBitrate = qBound(100000, bitrate, 20000000);
     canDecodeH264 = h264Decode;
     daveGroupId = groupId;
 }
@@ -471,10 +474,10 @@ void VoiceClient::advertiseVideo()
     }
     const QJsonObject stream{{"type", "video"}, {"rid", "100"}, {"ssrc", qint64(localVideoSsrc)},
         {"rtx_ssrc", qint64(localRtxSsrc)}, {"active", true}, {"quality", 100},
-        {"max_bitrate", desktopVideo ? (videoFps > 30 ? 4500000 : 3000000) : 600000},
+        {"max_bitrate", desktopVideo ? videoBitrate : 600000},
         {"max_framerate", desktopVideo ? videoFps : 15},
-        {"max_resolution", QJsonObject{{"type", "fixed"}, {"width", desktopVideo ? 1280 : 640},
-                                      {"height", desktopVideo ? 720 : 360}}}};
+        {"max_resolution", QJsonObject{{"type", "fixed"}, {"width", desktopVideo ? videoResolution.width() : 640},
+                                      {"height", desktopVideo ? videoResolution.height() : 360}}}};
     gateway->sendVideoState({{"audio_ssrc", qint64(localSsrc)}, {"video_ssrc", qint64(localVideoSsrc)},
         {"rtx_ssrc", qint64(localRtxSsrc)}, {"streams", QJsonArray{stream}}});
 }
@@ -518,7 +521,7 @@ bool VoiceClient::sendVideoFrame(const QByteArray &frame, uint32_t timestamp)
     // Do not send plaintext video during MLS setup. The probe waits for DAVE.
     if (!videoSession || !videoPublisher || !localVideoSsrc || !isDaveEnabled() ||
         currentState != State::Connected || !encryption || !udpTransport ||
-        !videoFragments.isEmpty() || frame.isEmpty() || frame.size() > 128 * 1024)
+        !videoFragments.isEmpty() || frame.isEmpty() || frame.size() > 512 * 1024)
         return false;
     auto *enc = daveSession->encryptor();
     QByteArray ciphertext(int(enc->GetMaxCiphertextByteSize(discord::dave::MediaType::Video, frame.size())), '\0');
@@ -548,7 +551,10 @@ bool VoiceClient::sendVideoFrame(const QByteArray &frame, uint32_t timestamp)
                 return;
             }
             // Bounded pacing, never queue another encoded frame behind this one.
-            for (int i = 0; i < 2 && videoFragmentIndex < videoFragments.size(); ++i) {
+            // Give high-quality desktop keyframes enough bounded burst capacity;
+            // two packets per tick previously capped throughput near 8 Mbps.
+            const int burstPackets = desktopVideo ? 8 : 2;
+            for (int i = 0; i < burstPackets && videoFragmentIndex < videoFragments.size(); ++i) {
                 RtpHeader header;
                 header.payloadType = 103;
                 header.sequence = videoSequence++;

@@ -135,7 +135,8 @@ try {
     if (-not (Test-Path -LiteralPath $exe)) { throw "acheron.exe is missing in $output." }
     $env:ACHERON_GOLIVE_PROBE = '0'
     Write-Host "Launching new build: $exe"
-    Write-Host 'Ctrl+Shift+V > Watch streams / Share screen. Select 30 or 60 FPS before Share.'
+    Write-Host 'Ctrl+Shift+V > Watch streams / Share screen. Select quality and 30 or 60 FPS before Share.'
+    Write-Host '1080p Maximum uses 12 Mbps at 30 FPS or 16 Mbps at 60 FPS. Viewing has zoom, Fit and Fullscreen controls.'
     Write-Host 'Viewing supports VP8/H264. The statistics row shows actual FPS and receive/decryption progress.'
     Start-Process -FilePath $exe -WorkingDirectory $output | Out-Null
 } catch {

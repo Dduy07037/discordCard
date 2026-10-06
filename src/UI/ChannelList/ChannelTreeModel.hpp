@@ -46,6 +46,7 @@ public:
         FolderColorRole = Qt::UserRole + 13,
         ThreadJoinedRole = Qt::UserRole + 14,
         OwnerIdRole = Qt::UserRole + 15,
+        IsStreamingRole = Qt::UserRole + 16,
     };
 
     QModelIndex index(int row, int column, const QModelIndex &parentIndex) const override;

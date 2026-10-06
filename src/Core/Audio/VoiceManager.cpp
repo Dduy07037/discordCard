@@ -59,7 +59,8 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
                                 oldState.selfDeaf.get() != state.selfDeaf.get() ||
                                 oldState.mute.get() != state.mute.get() ||
                                 oldState.deaf.get() != state.deaf.get() ||
-                                oldState.suppress.get() != state.suppress.get();
+                                oldState.suppress.get() != state.suppress.get() ||
+                                oldState.selfStream.get() != state.selfStream.get();
             if (stateDiffers)
                 emit participantVoiceStateChanged(newChannel, userId);
         }
@@ -72,6 +73,7 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
             voiceSessionId.clear();
             channelId = Snowflake::Invalid;
             guildId = Snowflake::Invalid;
+            selfStream = false;
             pending = {};
 
             if (oldChannel.isValid())
@@ -105,13 +107,16 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
 
         bool wasMuted = selfMute;
         bool wasDeaf = selfDeaf;
+        bool wasStreaming = selfStream;
         selfMute = state.selfMute.get();
         selfDeaf = state.selfDeaf.get();
+        selfStream = state.selfStream.get();
 
         qCInfo(LogVoice) << "Voice state: session =" << voiceSessionId
                          << "channel =" << channelId << "guild =" << guildId;
 
-        if (!channelChanged && channelId.isValid() && (selfMute != wasMuted || selfDeaf != wasDeaf))
+        if (!channelChanged && channelId.isValid() &&
+            (selfMute != wasMuted || selfDeaf != wasDeaf || selfStream != wasStreaming))
             emit participantVoiceStateChanged(channelId, accountId);
 
         if (audioPipeline && (selfMute != wasMuted || selfDeaf != wasDeaf)) {
@@ -413,6 +418,7 @@ std::optional<Discord::VoiceState> VoiceManager::voiceStateForUser(Snowflake use
             state.guildId = guildId;
         state.selfMute = selfMute;
         state.selfDeaf = selfDeaf;
+        state.selfStream = selfStream;
         state.sessionId = voiceSessionId;
         return state;
     }

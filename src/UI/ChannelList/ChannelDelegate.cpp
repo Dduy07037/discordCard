@@ -396,24 +396,43 @@ void ChannelDelegate::paint(QPainter *painter, const QStyleOptionViewItem &optio
 
         bool muted = index.data(ChannelTreeModel::IsVoiceMutedRole).toBool();
         bool deafened = index.data(ChannelTreeModel::IsVoiceDeafenedRole).toBool();
+        bool streaming = index.data(ChannelTreeModel::IsStreamingRole).toBool();
+        const auto normalFont = painter->font();
+        auto badgeFont = normalFont;
+        badgeFont.setPixelSize(10);
+        badgeFont.setBold(true);
+        const QString badgeText = tr("TRỰC TIẾP");
+        const int badgeWidth = QFontMetrics(badgeFont).horizontalAdvance(badgeText) + 12;
+        const int liveReserve = streaming ? badgeWidth + 8 : 0;
         constexpr int statusIconSize = 14;
         int iconCount = (muted ? 1 : 0) + (deafened ? 1 : 0);
-        int rightReserve = iconCount > 0 ? (iconCount * (statusIconSize + 4) + 4) : 4;
+        int rightReserve = (iconCount > 0 ? (iconCount * (statusIconSize + 4) + 4) : 4) + liveReserve;
 
         QColor textColor = option.palette.text().color();
         QRect textRect =
                 contentOpt.rect.adjusted(participantIndent + avatarSize + 6, 0, -rightReserve, 0);
         painter->setPen(textColor);
         QString elidedName = painter->fontMetrics().elidedText(
-                index.data(Qt::DisplayRole).toString(), Qt::ElideRight, textRect.width());
+                index.data(Qt::DisplayRole).toString(), Qt::ElideRight, qMax(0, textRect.width()));
         painter->drawText(textRect, Qt::AlignLeft | Qt::AlignVCenter, elidedName);
+        if (streaming) {
+            const QRect badge(contentOpt.rect.right() - badgeWidth - 4,
+                contentOpt.rect.center().y() - 8, badgeWidth, 17);
+            painter->setFont(badgeFont);
+            painter->setPen(Qt::NoPen);
+            painter->setBrush(QColor(QStringLiteral("#da373c")));
+            painter->drawRoundedRect(badge, 8, 8);
+            painter->setPen(Qt::white);
+            painter->drawText(badge, Qt::AlignCenter, badgeText);
+            painter->setFont(normalFont);
+        }
 
         if (muted || deafened) {
             QColor iconColor = option.palette.text().color();
             iconColor.setAlphaF(0.7f);
             QColor bgColor = option.palette.base().color();
             int iconY = contentOpt.rect.top() + (contentOpt.rect.height() - statusIconSize) / 2;
-            int iconX = contentOpt.rect.right() - statusIconSize - 4;
+            int iconX = contentOpt.rect.right() - statusIconSize - 4 - liveReserve;
             if (deafened) {
                 drawDeafenedIcon(painter,
                                  QRectF(iconX, iconY, statusIconSize, statusIconSize), iconColor,

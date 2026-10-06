@@ -141,6 +141,9 @@ private:
     bool selfMute = false;
     bool selfDeaf = false;
 
+    // Keep the server-confirmed sharing flag for the local participant as well.
+    bool selfStream = false;
+
     // pending data: VOICE_SERVER_UPDATE may arrive before VOICE_STATE_UPDATE
     // both are needed to connect
     struct PendingConnection

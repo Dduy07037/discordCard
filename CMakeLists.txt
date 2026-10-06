@@ -283,7 +283,7 @@ if(ENABLE_VOICE)
 endif()
 
 if(ENABLE_VOICE AND TARGET ffmpeg)
-    list(APPEND PROJECT_SOURCES src/Core/Media/RealtimeVp8.cpp src/UI/GoLiveProbeDialog.cpp)
+    list(APPEND PROJECT_SOURCES src/Core/Media/RealtimeVp8.cpp src/UI/GoLiveProbeDialog.cpp src/UI/StreamVideoView.cpp)
 endif()
 
 if(ENABLE_VOICE OR TARGET ffmpeg)

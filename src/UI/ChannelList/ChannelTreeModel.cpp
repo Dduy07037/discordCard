@@ -226,7 +226,7 @@ QVariant ChannelTreeModel::data(const QModelIndex &index, int role) const
         return instance && instance->isThreadJoined(node->id);
     }
 
-    if (role == IsVoiceMutedRole || role == IsVoiceDeafenedRole) {
+    if (role == IsVoiceMutedRole || role == IsVoiceDeafenedRole || role == IsStreamingRole) {
         if (node->type != ChannelNode::Type::VoiceParticipant)
             return false;
 #ifndef ACHERON_NO_VOICE
@@ -239,6 +239,8 @@ QVariant ChannelTreeModel::data(const QModelIndex &index, int role) const
         auto state = instance->voice()->voiceStateForUser(node->id);
         if (!state.has_value())
             return false;
+        if (role == IsStreamingRole)
+            return state->selfStream.get();
         if (role == IsVoiceMutedRole)
             return state->selfMute.get() || state->mute.get();
         return state->selfDeaf.get() || state->deaf.get();
@@ -1781,7 +1783,7 @@ void ChannelTreeModel::updateVoiceParticipantState(Snowflake channelId, Snowflak
         if (child->type == ChannelNode::Type::VoiceParticipant && child->id == userId) {
             QModelIndex idx = indexForNode(child.get());
             if (idx.isValid())
-                emit dataChanged(idx, idx, { IsVoiceMutedRole, IsVoiceDeafenedRole });
+                emit dataChanged(idx, idx, { IsVoiceMutedRole, IsVoiceDeafenedRole, IsStreamingRole });
             return;
         }
     }

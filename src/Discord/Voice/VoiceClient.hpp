@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QTimer>
 #include <QSet>
+#include <QSize>
 
 #include <atomic>
 #include <array>
@@ -68,7 +69,8 @@ public:
     void setSpeaking(bool speaking);
     // Experimental Go Live adapter: call before start(), on its own worker.
     void configureVideoSession(Core::Snowflake daveGroupId, bool publisher, bool desktop = false,
-                               int fps = 30, bool h264Decode = false);
+                               int fps = 30, bool h264Decode = false,
+                               QSize resolution = QSize(1280, 720), int bitrate = 3000000);
     bool sendVideoFrame(const QByteArray &vp8Frame, uint32_t timestamp);
     bool canSendVideoFrame() const;
     void advertiseVideo();
@@ -126,6 +128,8 @@ private:
     bool desktopVideo = false;
     bool canDecodeH264 = false;
     int videoFps = 30;
+    QSize videoResolution{1280, 720};
+    int videoBitrate = 3000000;
     QString selectedVideoCodec;
     quint64 videoPackets = 0, videoFrames = 0, videoSentFrames = 0, videoDecryptFailures = 0, videoTransportFailures = 0, unknownVideoSources = 0;
     QSet<quint32> remoteVideoSsrcs;

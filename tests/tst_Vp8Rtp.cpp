@@ -4,7 +4,9 @@
 #include "Discord/Voice/Vp8Rtp.hpp"
 #include "Discord/Voice/H264Rtp.hpp"
 #include <QElapsedTimer>
+#include <QPainter>
 #include "Core/Media/LatestVideoFrame.hpp"
+#include "Core/Media/ScreenShareSettings.hpp"
 #ifdef TEST_VP8_CODEC
 #include "Core/Media/RealtimeVp8.hpp"
 #endif
@@ -28,6 +30,7 @@ private slots:
     void desktopCodecKeepsAspectRatio();
     void higherFrameRates_data();
     void higherFrameRates();
+    void highQualityDesktopKeepsFineDetail();
     void h264DecodeAndDavePacketization();
 #endif
 };
@@ -70,7 +73,7 @@ void TestVp8Rtp::daveBeforeFragmentation()
     decryptor->TransitionToPassthroughMode(false, std::chrono::seconds(0));
     // VP8 delta frame has a single clear byte; keyframe has ten clear bytes.
     for (const auto first : {char(0), char(1)}) {
-        QByteArray frame(25000, 'v');
+        QByteArray frame(300000, 'v');
         frame[0] = first;
         QByteArray ciphertext(int(encryptor->GetMaxCiphertextByteSize(discord::dave::MediaType::Video, frame.size())), '\0');
         size_t written = 0;
@@ -269,17 +272,25 @@ void TestVp8Rtp::desktopCodecKeepsAspectRatio()
 void TestVp8Rtp::higherFrameRates_data()
 {
     QTest::addColumn<int>("fps");
-    QTest::newRow("720p30") << 30;
-    QTest::newRow("720p60") << 60;
+    QTest::addColumn<QSize>("size");
+    QTest::addColumn<int>("bitrate");
+    QTest::newRow("720p30") << 30 << QSize(1280, 720) << 3000000;
+    QTest::newRow("720p60") << 60 << QSize(1280, 720) << 4500000;
+    for (const int fps : {30, 60}) {
+        const auto settings = Acheron::Core::Media::ScreenShareSettings::forPreset(2, fps);
+        QTest::newRow(fps == 30 ? "1080p-maximum30" : "1080p-maximum60") << fps << settings.resolution << settings.bitrate;
+    }
 }
 void TestVp8Rtp::higherFrameRates()
 {
     QFETCH(int, fps);
+    QFETCH(QSize, size);
+    QFETCH(int, bitrate);
     Acheron::Core::Media::RealtimeVp8 encoder, decoder;
     QVERIFY(!encoder.openEncoder(QSize(1280, 720), 61, 3000000));
-    QVERIFY(encoder.openEncoder(QSize(1280, 720), fps, fps > 30 ? 4500000 : 3000000));
+    QVERIFY2(encoder.openEncoder(size, fps, bitrate), qPrintable(encoder.error()));
     QVERIFY(decoder.openDecoder());
-    QImage image(1280, 720, QImage::Format_RGB32);
+    QImage image(size, QImage::Format_RGB32);
     QElapsedTimer elapsed; elapsed.start();
     for (int i = 0; i < fps; ++i) {
         image.fill(QColor(30 + i, 100, 180));
@@ -287,9 +298,31 @@ void TestVp8Rtp::higherFrameRates()
         QVERIFY(!encoded.isEmpty());
         const auto decoded = decoder.decode(encoded);
         QCOMPARE(decoded.size(), image.size());
-        QVERIFY(std::abs(decoded.pixelColor(640, 360).red() - (30 + i)) < 10);
+        QVERIFY(std::abs(decoded.pixelColor(size.width() / 2, size.height() / 2).red() - (30 + i)) < 10);
     }
-    qInfo() << "720p target" << fps << "FPS:" << fps << "immediate codec roundtrips in" << elapsed.elapsed() << "ms";
+    qInfo() << size << "target" << fps << "FPS:" << fps << "immediate codec roundtrips in" << elapsed.elapsed() << "ms";
+}
+
+void TestVp8Rtp::highQualityDesktopKeepsFineDetail()
+{
+    const auto settings = Acheron::Core::Media::ScreenShareSettings::forPreset(2, 30);
+    Acheron::Core::Media::RealtimeVp8 encoder, decoder;
+    QVERIFY(encoder.openEncoder(settings.resolution, 30, settings.bitrate));
+    QVERIFY(decoder.openDecoder());
+    QImage desktop(settings.resolution, QImage::Format_RGB32);
+    desktop.fill(Qt::white);
+    {
+        QPainter painter(&desktop);
+        // Native one-pixel strokes lose contrast when downscaled to 720p.
+        for (int x = 100; x < 200; x += 2) painter.fillRect(x, 100, 1, 300, Qt::black);
+        painter.fillRect(250, 200, 400, 1, Qt::black);
+    }
+    const auto encoded = encoder.encode(desktop, true);
+    QVERIFY(!encoded.isEmpty());
+    QVERIFY(encoded.size() <= 512 * 1024);
+    const auto decoded = decoder.decode(encoded);
+    QCOMPARE(decoded.size(), desktop.size());
+    QVERIFY(decoded.pixelColor(101, 250).red() - decoded.pixelColor(100, 250).red() > 160);
 }
 
 void TestVp8Rtp::h264DecodeAndDavePacketization()

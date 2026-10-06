@@ -7,6 +7,7 @@
 #include <memory>
 #include <functional>
 #include "Core/Snowflake.hpp"
+#include "Core/Media/ScreenShareSettings.hpp"
 
 class QLabel;
 class QCheckBox;
@@ -21,6 +22,7 @@ namespace Acheron::Core::Media { class LatestVideoFrame; }
 namespace Acheron::UI {
 class ProbeMediaWorker;
 struct ProbeFrameMailbox;
+class StreamVideoView;
 
 // Experimental VP8/H264/DAVE viewer and explicit, user-selected monitor sharing.
 // The protocol test card/tone is an optional diagnostic, not the default source.
@@ -47,12 +49,14 @@ private:
     QPointer<Core::Audio::VoiceManager> manager;
     Core::Snowflake accountId;
     QLabel *status = nullptr;
-    QLabel *video = nullptr;
+    StreamVideoView *video = nullptr;
     QCheckBox *tone = nullptr;
     QCheckBox *sound = nullptr;
     QComboBox *streams = nullptr;
     QComboBox *screens = nullptr;
     QComboBox *frameRate = nullptr;
+    QComboBox *quality = nullptr;
+    QLabel *qualityHint = nullptr;
     QList<QPointer<QScreen>> screenList;
     QPointer<QScreen> capturedScreen;
     QTimer *captureTimer = nullptr;
@@ -62,6 +66,7 @@ private:
     QLabel *publisherStats = nullptr;
     QLabel *viewerStats = nullptr;
     int publishingFps = 30;
+    Core::Media::ScreenShareSettings publishingQuality;
     qint64 lastPreviewAtMs = 0;
     QPushButton *share = nullptr;
     QPushButton *testCard = nullptr;

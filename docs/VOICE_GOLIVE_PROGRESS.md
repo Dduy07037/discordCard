@@ -1,7 +1,7 @@
 # Voice and Go Live implementation checkpoint
 
 Baseline: `6976b2c9cc8055ee0e5689e9746fd009e77affe1` (`main`).
-Branch: `feat/voice-golive`. This is a reviewable implementation checkpoint, not a release or a claim of proven Discord interoperability.
+Branch: `feat/voice-golive`. This is a reviewable implementation checkpoint, not a release or a claim of compatibility across all Discord clients/platforms.
 
 ## Voice changes
 
@@ -15,7 +15,7 @@ Branch: `feat/voice-golive`. This is a reviewable implementation checkpoint, not
 
 ## Experimental screen sharing and stream viewer
 
-The voice window now has a visible **Watch streams / Share screen (experimental)** button. Open it from **View → Voice Controls / Go Live**, **Ctrl+Shift+V**, or a voice channel’s context menu. This experimental implementation has separate viewer/publisher transports; official Discord interoperability is not yet verified. The diagnostic test card/tone alone requires `ACHERON_GOLIVE_PROBE=1`.
+The voice window now has a visible **Watch streams / Share screen (experimental)** button. Open it from **View → Voice Controls / Go Live**, **Ctrl+Shift+V**, or a voice channel’s context menu. This experimental implementation has separate viewer/publisher transports. The user has reported both publishing and viewing working on their Windows setup; the build environment itself has no signed-in Discord session. The diagnostic test card/tone alone requires `ACHERON_GOLIVE_PROBE=1`.
 
 Implemented:
 
@@ -23,8 +23,8 @@ Implemented:
 - Session ownership/context validation, either arrival order of CREATE/SERVER_UPDATE, duplicate suppression, timeout, token replacement and cleanup on leaving voice.
 - Separate native UDP RTC session using the existing transport encryption and libdave implementation. Normal voice continues in its own workers.
 - Explicit monitor selection, one-shot local preview, and real desktop capture through Qt QScreen on supported desktops. Capture starts only on Share, stops on Stop/close/leave/monitor removal, and is never resumed automatically after the stream is deleted. A single replaceable frame connects GUI capture to the separate encoding worker; images older than 150 ms are discarded.
-- VP8 publishing and VP8/H264 receive negotiation: monitor video is letterboxed to 1280×720, with 15/30/60 FPS targets (30 default) and up to 4.5 Mbps. Capture and encode timers use the selected rate; actual completed-frame FPS is displayed. The optional diagnostic test card stays at 640×360 / 15 fps / 600 kbps. There is no system-audio or microphone capture in the stream publisher; the main voice call remains separate.
-- Watchers are listed by display name when available; watching and sharing have separate Stop controls. A receive worker decodes VP8 and optionally plays stream audio.
+- VP8 publishing and VP8/H264 receive negotiation: monitor video is letterboxed to the selected 720p or 1080p resolution, with 15/30/60 FPS targets (30 default) and 4–16 Mbps profiles (1080p Maximum / 12 Mbps at 30 FPS default). Capture and encode timers use the selected rate; actual completed-frame FPS is displayed. The optional diagnostic test card stays at 640×360 / 15 fps / 600 kbps. There is no system-audio or microphone capture in the stream publisher; the main voice call remains separate.
+- Watchers are listed by display name when available; watching and sharing have separate Stop controls. A receive worker decodes VP8/H264 and optionally plays stream audio. Original decoded images support zoom, drag-to-pan, fitting to a resizable window and fullscreen. A red TRỰC TIẾP badge in voice participant rows follows the server's sharing flag.
 - DAVE encryption of a complete VP8 frame **before** RTP fragmentation; full reassembly **before** DAVE decryption. No plaintext outbound video during MLS setup.
 - Packet pacing with one bounded pending frame; bounded reassembly, deadline expiry, sequence/timestamp wrap handling, extension parsing, RTX mapping from session metadata, duplicate/late-frame suppression and latest-image rendering.
 
@@ -73,7 +73,7 @@ Voice tests cover fragmented capture timestamps, ring capacity/concurrent access
 
 Stream tests cover signaling ordering/ownership, token changes, parser bounds, out-of-order/duplicate/missing packets, descriptor extensions, memory/expiry limits, timestamp wrap and DAVE-before-fragmentation roundtrips. VP8 encode/decode is checked over 30 frames without an encode backlog.
 
-Local validation configuration: Linux x86_64, GCC 13, Qt 6.10.2, FFmpeg 6.1.1, Opus 1.4, libdave at the repository pin; full build with RNNoise on, and minimal build with voice/FFmpeg off. Development builds use `ALLOW_PLAIN_CURL=ON`; production CI retains curl-impersonate. Plain-curl development builds are not a substitute for Discord connectivity verification. See the PR for completed build/test results and CI status.
+Local validation configuration: Linux x86_64, GCC 13, Qt 6.10.2, FFmpeg 6.1.1, Opus 1.4, libdave at the repository pin; full build with RNNoise on, and minimal build with voice/FFmpeg off. Development builds use `ALLOW_PLAIN_CURL=ON`; production CI retains curl-impersonate. Plain-curl development builds are not a substitute for Discord connectivity verification. See the commit and Actions run for completed build/test results and CI status.
 
 ## Reference implementations
 
@@ -111,3 +111,28 @@ The script `scripts/update-and-run-windows.ps1` downloads the full Windows artif
 The updater was exercised with a mocked GitHub CLI: it selects the requested commit and full Windows artifact even when another job fails, and refuses to launch when the full Windows job fails. This check used PowerShell 7 on Linux with only the Windows host guard bypassed; actual Windows PowerShell 5.1 execution remains a native validation step.
 
 Additional implementation references: [RFC 6184](https://www.rfc-editor.org/rfc/rfc6184) (H264 RTP), [RFC 4585](https://www.rfc-editor.org/rfc/rfc4585) (PLI), [Discord DAVE protocol](https://github.com/discord/dave-protocol/blob/main/protocol.md) (codec clear ranges), and the current [discord-native-voice](https://github.com/dolfies/discord-native-voice) receiver/RTCP code. No third-party implementation source was copied; the test fixture was generated locally.
+
+
+## Zoom, quality profiles and live badges
+
+The user reported that watching streams works after the receive/FPS update. This update addresses viewer sizing, publishing quality and identifying live participants.
+
+The viewer retains the decoded image at its original resolution. The minus/plus buttons and mouse wheel change zoom from 25% to 800% of the fitted image; dragging pans an enlarged image. Fit resets zoom and centers it. Window resize recomputes the fitted size, while new frames preserve zoom/pan. Fullscreen displays the same frames in a separate window without another RTC session; Esc or Exit fullscreen closes only that window. End/stop clears both views, and the Go Live window can be maximized.
+
+Publishing profiles use one immutable resolution/bitrate choice for the encoder and the advertised video state:
+
+| Profile | Resolution | 15/30 FPS target bitrate | 60 FPS target bitrate |
+| --- | --- | --- | --- |
+| Balanced | 1280 × 720 | 4 Mbps | 6 Mbps |
+| High | 1920 × 1080 | 8 Mbps | 12 Mbps |
+| Maximum (default) | 1920 × 1080 | 12 Mbps | 16 Mbps |
+
+The frame-rate default remains 30 FPS. Higher resolution cannot recover detail absent in the captured monitor or a received lower-resolution stream. Bitrate is a codec target; actual wire rate, delivered FPS and quality depend on content, CPU, capture and available bandwidth. Libvpx uses a slower quality setting at up to 30 FPS, a faster setting at 60 FPS, bounded quantization and smooth letterboxing. It remains software VP8 encoding; there is no new hardware encoder or congestion controller.
+
+The desktop pacer allows at most eight packets per 2 ms tick, compared with the previous two-packet ceiling near 8 Mbps. Encoded frame capacity increases from 128 KiB to 512 KiB for larger 1080p keyframes. One pending frame, 150 ms expiry, DAVE-before-fragmentation and independent main-voice workers remain.
+
+Voice participant rows paint a red TRỰC TIẾP badge beside users whose server-confirmed self_stream is true. The local participant now retains this flag too. Start/stop changes trigger the participant row update, and the live-stream picker also labels active streamers. Names are elided with space reserved for the badge and mute/deafen icons.
+
+Validation: full application build and 10/10 test groups, minimal build and 6/6 groups. Added 1080p maximum-profile roundtrips at 30/60 FPS, native one-pixel contrast retention, and 300 KiB DAVE/RTP frame roundtrips. An offscreen harness checks quality/FPS defaults, original frame resolution, zoom persistence across resize/new frames, wheel zoom/bounds, fullscreen open/update/clear/close/reopen, local/remote live start/stop notifications, badge rendering alongside muted/deafened icons and sharing disabled without voice. These checks do not measure native Windows capture or a live high-bitrate Discord stream.
+
+References for this update: [FFmpeg libvpx options](https://ffmpeg.org/ffmpeg-codecs.html#libvpx) and Qt QWidget/QPainter event/rendering APIs. No third-party implementation code was copied.
