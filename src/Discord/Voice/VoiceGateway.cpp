@@ -82,11 +82,22 @@ void VoiceGateway::sendSelectProtocol(const QString &address, int port, const QS
         vp8.name = "VP8";
         vp8.payloadType = 103;
         vp8.rtxPayloadType = 104;
-        vp8.priority = 1000;
+        vp8.priority = videoPublisher ? 1000 : 2000;
         vp8.type = "video";
-        vp8.encode = true;
+        vp8.encode = videoPublisher;
         vp8.decode = true;
         data.codecs->append(vp8);
+        if (!videoPublisher && canDecodeH264) {
+            Codec h264;
+            h264.name = "H264";
+            h264.payloadType = 101;
+            h264.rtxPayloadType = 102;
+            h264.priority = 1000;
+            h264.type = "video";
+            h264.encode = false;
+            h264.decode = true;
+            data.codecs->append(h264);
+        }
     }
 
     QJsonObject obj;
@@ -201,6 +212,9 @@ void VoiceGateway::onPayloadReceived(const QJsonObject &root)
         handleClientsConnected(d.toObject());
         break;
     case VoiceOpCode::SESSION_UPDATE:
+        emit sessionUpdated(d.toObject());
+        break;
+    case VoiceOpCode::VIDEO:
         handleClientConnect(d.toObject());
         break;
     case VoiceOpCode::CLIENT_DISCONNECT:

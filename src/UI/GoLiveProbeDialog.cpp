@@ -38,14 +38,14 @@ class ProbeMediaWorker : public QObject
 public:
     ProbeMediaWorker(const QJsonObject &connection, Core::Snowflake accountId,
                      const Core::ProxyConfig &proxy, std::shared_ptr<ProbeFrameMailbox> mailbox,
-                     std::shared_ptr<Core::Media::LatestVideoFrame> captureFrames = {})
+                     std::shared_ptr<Core::Media::LatestVideoFrame> captureFrames = {}, int fps = 30)
         : connection(connection), accountId(accountId), proxy(proxy), mailbox(std::move(mailbox)),
-          captureFrames(std::move(captureFrames)) {}
+          captureFrames(std::move(captureFrames)), fps(fps) {}
     void start()
     {
         const bool publisher = connection.value("publisher").toBool();
-        if ((!publisher && !codec.openDecoder()) || (publisher &&
-            !(captureFrames ? codec.openEncoder(QSize(1280, 720), 15, 1800000) : codec.openEncoder()))) {
+        if (publisher &&
+            !(captureFrames ? codec.openEncoder(QSize(1280, 720), fps, fps > 30 ? 4500000 : 3000000) : codec.openEncoder())) {
             emit statusChanged(codec.error().isEmpty() ? tr("VP8 decoder unavailable.") : codec.error());
             return;
         }
@@ -56,7 +56,12 @@ public:
             connection.value("voice_session_id").toString(), proxy, this);
         // Reverse-engineered stream MLS group convention. This needs official
         // Discord interoperability verification; never used for normal voice.
-        client->configureVideoSession(Core::Snowflake(quint64(rtcServer) - 1), publisher, bool(captureFrames));
+        client->configureVideoSession(Core::Snowflake(quint64(rtcServer) - 1), publisher, bool(captureFrames), fps,
+                                     Core::Media::RealtimeVp8::hasDecoder(QStringLiteral("H264")));
+        connect(client, &Discord::Voice::VoiceClient::videoCodecChanged, this, [this, publisher](const QString &name) {
+            if (!publisher && !codec.openDecoder(name)) emit statusChanged(codec.error());
+        });
+        connect(client, &Discord::Voice::VoiceClient::videoKeyframeRequested, this, [this] { needKeyframe = true; });
         connect(client, &Discord::Voice::VoiceClient::connected, this, [this, publisher] {
             if (frameTimer) { delete frameTimer; frameTimer = nullptr; }
             if (audioTimer) { delete audioTimer; audioTimer = nullptr; }
@@ -69,7 +74,7 @@ public:
             if (publisher) {
                 frameTimer = new QTimer(this);
                 frameTimer->setTimerType(Qt::PreciseTimer);
-                frameTimer->setInterval(67);
+                frameTimer->setInterval(captureFrames ? qRound(1000.0 / fps) : 67);
                 connect(frameTimer, &QTimer::timeout, this, &ProbeMediaWorker::sendFrame);
                 frameTimer->start();
                 toneEncoder.init(48000, 2, OPUS_APPLICATION_AUDIO);
@@ -89,20 +94,44 @@ public:
             }
         });
         connect(client, &Discord::Voice::VoiceClient::disconnected, this, [this] {
-            emit statusChanged(tr("Stream disconnected. Stop and retry the probe."));
+            emit statusChanged(failure.isEmpty() ? tr("Stream disconnected. Stop and retry.") : failure);
             if (frameTimer) frameTimer->stop();
             if (audioTimer) audioTimer->stop();
         });
-        connect(client, &Discord::Voice::VoiceClient::videoError, this, &ProbeMediaWorker::statusChanged);
+        connect(client, &Discord::Voice::VoiceClient::videoError, this, [this](const QString &reason) {
+            failure = reason;
+            emit statusChanged(reason);
+        });
         connect(client, &Discord::Voice::VoiceClient::videoReceived, this,
-            [this](quint32, uint32_t, const QByteArray &encoded) {
+            [this](quint32 ssrc, uint32_t, const QByteArray &encoded) {
                 const auto image = codec.decode(encoded);
-                if (image.isNull())
+                if (image.isNull()) {
+                    client->requestVideoKeyframe(ssrc);
                     return;
+                }
+                ++decodedFrames;
                 std::lock_guard lock(mailbox->mutex);
                 mailbox->image = image;
                 ++mailbox->generation;
             });
+        statsClock.start();
+        auto *statsTimer = new QTimer(this);
+        statsTimer->setInterval(1000);
+        connect(statsTimer, &QTimer::timeout, this, [this, publisher] {
+            const auto stats = client->videoDiagnostics();
+            const auto total = publisher ? quint64(stats.value("sent_frames").toDouble()) : decodedFrames;
+            const auto elapsed = statsClock.restart();
+            const auto rate = elapsed > 0 && total >= lastStatsFrames
+                ? double(total - lastStatsFrames) * 1000 / elapsed : 0.0;
+            lastStatsFrames = total;
+            emit statisticsChanged(tr("%1 • DAVE %2 • %3 FPS • sources %4 • packets %5 • frames %6 • transport errors %7 • DAVE errors %8 • unmapped %9")
+                .arg(stats.value("codec").toString().isEmpty() ? tr("negotiating") : stats.value("codec").toString())
+                .arg(stats.value("dave_ready").toBool() ? tr("ready") : tr("waiting"))
+                .arg(rate, 0, 'f', 1).arg(stats.value("sources").toInt()).arg(stats.value("packets").toDouble(), 0, 'f', 0)
+                .arg(total).arg(stats.value("transport_errors").toDouble(), 0, 'f', 0)
+                .arg(stats.value("dave_errors").toDouble(), 0, 'f', 0).arg(stats.value("unknown_sources").toDouble(), 0, 'f', 0));
+        });
+        statsTimer->start();
         client->start();
     }
     void stop()
@@ -121,15 +150,16 @@ public:
     }
 signals:
     void statusChanged(const QString &text);
+    void statisticsChanged(const QString &text);
 private:
     void sendFrame()
     {
-        if (!client->isDaveEnabled())
+        if (!client->canSendVideoFrame())
             return;
         if (captureFrames) {
             const auto frame = captureFrames->take(Core::Media::videoClockMs());
             if (!frame) return;
-            const auto encoded = codec.encode(frame->image, needKeyframe || frames++ % 15 == 0);
+            const auto encoded = codec.encode(frame->image, needKeyframe || frames++ % fps == 0);
             needKeyframe = !client->sendVideoFrame(encoded, uint32_t(clock.elapsed() * 90));
             return;
         }
@@ -184,6 +214,10 @@ private:
     QTimer *frameTimer = nullptr;
     QTimer *audioTimer = nullptr;
     QElapsedTimer clock;
+    QElapsedTimer statsClock;
+    quint64 decodedFrames = 0, lastStatsFrames = 0;
+    int fps = 30;
+    QString failure;
     unsigned frames = 0;
     quint64 toneSample = 0;
     bool needKeyframe = true;
@@ -209,6 +243,18 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
     screens = new QComboBox(this);
     screens->setAccessibleName(tr("Screen to share"));
     layout->addWidget(screens);
+    auto *fpsRow = new QHBoxLayout;
+    fpsRow->addWidget(new QLabel(tr("Target frame rate"), this));
+    frameRate = new QComboBox(this);
+    frameRate->setAccessibleName(tr("Screen sharing frame rate"));
+    frameRate->addItem(tr("15 FPS"), 15);
+    frameRate->addItem(tr("30 FPS (default)"), 30);
+    frameRate->addItem(tr("60 FPS"), 60);
+    frameRate->setCurrentIndex(1);
+    frameRate->setToolTip(tr("720p. Actual FPS depends on capture, CPU and network speed. Stop sharing before changing."));
+    fpsRow->addWidget(frameRate);
+    fpsRow->addStretch();
+    layout->addLayout(fpsRow);
     auto *shareButtons = new QHBoxLayout;
     auto *previewButton = new QPushButton(tr("Preview screen"), this);
     share = new QPushButton(tr("Share selected screen"), this);
@@ -220,6 +266,14 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
     sharingStatus = new QLabel(tr("Screen sharing is off"), this);
     sharingStatus->setTextFormat(Qt::PlainText);
     layout->addWidget(sharingStatus);
+    publisherStatus = new QLabel(this);
+    publisherStatus->setTextFormat(Qt::PlainText);
+    publisherStatus->setWordWrap(true);
+    layout->addWidget(publisherStatus);
+    publisherStats = new QLabel(this);
+    publisherStats->setTextFormat(Qt::PlainText);
+    publisherStats->setWordWrap(true);
+    layout->addWidget(publisherStats);
     preview = new QLabel(tr("Preview appears only after you click Preview screen or Share."), this);
     preview->setAlignment(Qt::AlignCenter);
     preview->setWordWrap(true);
@@ -269,6 +323,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
         }
         captureFrames = std::make_shared<Core::Media::LatestVideoFrame>();
         captureFrames->push(std::move(image), capturedAt);
+        publishingFps = frameRate->currentData().toInt();
         if (!manager->goLive()->publish()) {
             stopCapture();
             sharingStatus->setText(tr("Could not start sharing. Stop any existing stream first."));
@@ -276,11 +331,12 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
         }
         requestedPublisher = manager->goLive()->publishingKey();
         screens->setEnabled(false);
+        frameRate->setEnabled(false);
         share->setEnabled(false);
         testCard->setEnabled(false);
-        captureTimer->start();
-        sharingStatus->setText(tr("Capturing %1 • 720p / 15 fps").arg(capturedScreen->name()));
-        status->setText(tr("Connecting screen stream…"));
+        captureTimer->start(qRound(1000.0 / publishingFps));
+        sharingStatus->setText(tr("Capturing %1 • 720p / target %2 FPS").arg(capturedScreen->name()).arg(publishingFps));
+        publisherStatus->setText(tr("Connecting screen stream…"));
     });
     connect(stopSharing, &QPushButton::clicked, this, [this] {
         stopCapture();
@@ -305,6 +361,10 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
     status->setWordWrap(true);
     status->setTextFormat(Qt::PlainText);
     layout->addWidget(status);
+    viewerStats = new QLabel(this);
+    viewerStats->setTextFormat(Qt::PlainText);
+    viewerStats->setWordWrap(true);
+    layout->addWidget(viewerStats);
     video = new QLabel(tr("No stream video yet"), this);
     video->setAlignment(Qt::AlignCenter);
     video->setMinimumSize(640, 220);
@@ -323,7 +383,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
         requestedPublisher = manager->goLive()->publishingKey();
         share->setEnabled(false);
         testCard->setEnabled(false);
-        status->setText(tr("Connecting diagnostic stream…"));
+        publisherStatus->setText(tr("Connecting diagnostic stream…"));
     });
     const auto refresh = [this, watch, nameResolver] {
         const auto selection = streams->currentData().toString();
@@ -356,6 +416,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
         requestedViewer.clear();
         video->clear();
         video->setText(tr("No stream video yet"));
+        viewerStats->clear();
     });
     connect(tone, &QCheckBox::toggled, this, [this](bool value) {
         if (publisher.worker) QMetaObject::invokeMethod(publisher.worker,
@@ -381,9 +442,10 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
     });
     connect(manager->goLive(), &Core::Audio::GoLiveSignaling::requestFailed, this,
         [this, refresh](const QString &key, const QString &reason) {
+            const bool wasPublisher = key == requestedPublisher;
             if (key == requestedPublisher) { stopCapture(); requestedPublisher.clear(); }
             if (key == requestedViewer) requestedViewer.clear();
-            status->setText(reason);
+            (wasPublisher ? publisherStatus : status)->setText(reason);
             refresh();
         });
     connect(voiceManager, &Core::Audio::VoiceManager::voiceStateChanged, this, refresh);
@@ -393,7 +455,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
     connect(voiceManager, &QObject::destroyed, this, &QDialog::reject);
     refresh();
     auto *render = new QTimer(this);
-    render->setInterval(67);
+    render->setInterval(16);
     connect(render, &QTimer::timeout, this, [this] {
         if (!viewer.mailbox) return;
         QImage image;
@@ -434,7 +496,11 @@ void GoLiveProbeDialog::captureDesktop()
         sharingStatus->setText(tr("Sharing stopped: screen capture failed."));
         return;
     }
-    preview->setPixmap(QPixmap::fromImage(image).scaled(preview->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
+    // Local thumbnail rendering is throttled independently of capture/encode.
+    if (capturedAt - lastPreviewAtMs >= 100) {
+        preview->setPixmap(QPixmap::fromImage(image).scaled(preview->size(), Qt::KeepAspectRatio, Qt::FastTransformation));
+        lastPreviewAtMs = capturedAt;
+    }
     captureFrames->push(std::move(image), capturedAt);
 }
 
@@ -445,6 +511,9 @@ void GoLiveProbeDialog::stopCapture()
     if (captureFrames) captureFrames->clear();
     captureFrames.reset();
     screens->setEnabled(true);
+    frameRate->setEnabled(true);
+    publisherStats->clear();
+    publisherStatus->clear();
     share->setEnabled(manager && manager->isConnected() && screens->count() > 0);
     if (testCard) testCard->setEnabled(manager && manager->isConnected());
     preview->clear();
@@ -473,7 +542,7 @@ void GoLiveProbeDialog::openSession(const QString &key, const QJsonObject &conne
     session.mailbox = std::make_shared<ProbeFrameMailbox>();
     session.thread = new QThread(this);
     session.worker = new ProbeMediaWorker(connection, accountId, manager->proxyConfig(), session.mailbox,
-        connection.value("publisher").toBool() ? captureFrames : nullptr);
+        connection.value("publisher").toBool() ? captureFrames : nullptr, publishingFps);
     session.worker->setTone(tone->isChecked());
     session.worker->setSound(sound->isChecked());
     session.worker->moveToThread(session.thread);
@@ -486,7 +555,12 @@ void GoLiveProbeDialog::openSession(const QString &key, const QJsonObject &conne
     connect(session.thread, &QThread::started, session.worker, &ProbeMediaWorker::start);
     connect(session.thread, &QThread::finished, session.worker, &QObject::deleteLater);
     connect(session.worker, &ProbeMediaWorker::statusChanged, this, [this, key](const QString &text) {
-        status->setText((key == requestedPublisher ? tr("Sharing: ") : tr("Watching: ")) + text);
+        if (key == requestedPublisher) publisherStatus->setText(tr("Sharing: ") + text);
+        else if (key == requestedViewer) status->setText(tr("Watching: ") + text);
+    });
+    connect(session.worker, &ProbeMediaWorker::statisticsChanged, this, [this, key](const QString &text) {
+        if (key == requestedPublisher) publisherStats->setText(text);
+        else if (key == requestedViewer) viewerStats->setText(text);
     });
     session.thread->start();
 }

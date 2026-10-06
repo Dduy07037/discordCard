@@ -2,6 +2,8 @@
 #include <dave/dave_interfaces.h>
 #include <bytes/bytes.h>
 #include "Discord/Voice/Vp8Rtp.hpp"
+#include "Discord/Voice/H264Rtp.hpp"
+#include <QElapsedTimer>
 #include "Core/Media/LatestVideoFrame.hpp"
 #ifdef TEST_VP8_CODEC
 #include "Core/Media/RealtimeVp8.hpp"
@@ -20,9 +22,13 @@ private slots:
     void boundsAndExpiry();
     void conflictingBoundaries();
     void newestScreenFrameAndExpiry();
+    void h264StapFuLossAndBounds();
 #ifdef TEST_VP8_CODEC
     void realtimeCodecRoundtrip();
     void desktopCodecKeepsAspectRatio();
+    void higherFrameRates_data();
+    void higherFrameRates();
+    void h264DecodeAndDavePacketization();
 #endif
 };
 
@@ -177,6 +183,42 @@ void TestVp8Rtp::conflictingBoundaries()
     QCOMPARE(receiver.bufferedFrameCount(), 0);
 }
 
+
+void TestVp8Rtp::h264StapFuLossAndBounds()
+{
+    H264Reassembler receiver;
+    // STAP-A carries a parameter set and an IDR; start codes are restored.
+    const auto stap = QByteArray::fromHex("780003674201000265aa");
+    const auto initial = receiver.push(65534, 0xfffffff0, true, stap, 0);
+    QVERIFY(initial);
+    QCOMPARE(*initial, QByteArray::fromHex("000000016742010000000165aa"));
+    // FU-A fragments arrive in reverse order and across a sequence wrap.
+    QVERIFY(!receiver.push(1, 0x10, true, QByteArray::fromHex("7c41cc"), 1));
+    QVERIFY(!receiver.push(0, 0x10, false, QByteArray::fromHex("7c01bb"), 2));
+    const auto next = receiver.push(65535, 0x10, false, QByteArray::fromHex("7c81aa"), 3);
+    QVERIFY(next);
+    QCOMPARE(*next, QByteArray::fromHex("0000000161aabbcc"));
+    QVERIFY(!receiver.push(65535, 0x10, false, QByteArray::fromHex("7c81aa"), 4));
+    QVERIFY(!receiver.push(2, 0x20, false, QByteArray::fromHex("7c81aa"), 5));
+    QVERIFY(!receiver.push(4, 0x20, true, QByteArray::fromHex("7c41cc"), 6));
+    // A newer parameter frame permits recovery after a missing frame.
+    QVERIFY(receiver.push(10, 0x30, true, stap, 7));
+    QVERIFY(!receiver.push(3, 0x20, false, QByteArray::fromHex("7c01bb"), 8));
+    QCOMPARE(receiver.bufferedFrameCount(), 0);
+    for (uint32_t t = 1; t < 1000; ++t) {
+        QVERIFY(!receiver.push(20, 0x100 + t, false, QByteArray::fromHex("7c81aa"), t));
+        QVERIFY(receiver.bufferedFrameCount() <= H264Reassembler::MaxBufferedFrames);
+    }
+    QVERIFY(receiver.droppedFrames() > 990);
+    receiver.reset();
+    for (const auto &bad : {QByteArray::fromHex("78000467"), QByteArray::fromHex("78800067"),
+                           QByteArray::fromHex("78000167000178"), QByteArray::fromHex("fc85aa")}) {
+        QVERIFY(!receiver.push(1, 1, true, bad, 2000));
+        receiver.reset();
+    }
+    QVERIFY(!receiver.push(1, 1, true, QByteArray(H264Reassembler::MaxFrameBytes + 1, 'x'), 2000));
+}
+
 #ifdef TEST_VP8_CODEC
 void TestVp8Rtp::realtimeCodecRoundtrip()
 {
@@ -222,6 +264,133 @@ void TestVp8Rtp::desktopCodecKeepsAspectRatio()
         QVERIFY(std::abs(center.green() - 100) < 8);
         QVERIFY(std::abs(center.blue() - 180) < 8);
     }
+}
+
+void TestVp8Rtp::higherFrameRates_data()
+{
+    QTest::addColumn<int>("fps");
+    QTest::newRow("720p30") << 30;
+    QTest::newRow("720p60") << 60;
+}
+void TestVp8Rtp::higherFrameRates()
+{
+    QFETCH(int, fps);
+    Acheron::Core::Media::RealtimeVp8 encoder, decoder;
+    QVERIFY(!encoder.openEncoder(QSize(1280, 720), 61, 3000000));
+    QVERIFY(encoder.openEncoder(QSize(1280, 720), fps, fps > 30 ? 4500000 : 3000000));
+    QVERIFY(decoder.openDecoder());
+    QImage image(1280, 720, QImage::Format_RGB32);
+    QElapsedTimer elapsed; elapsed.start();
+    for (int i = 0; i < fps; ++i) {
+        image.fill(QColor(30 + i, 100, 180));
+        const auto encoded = encoder.encode(image, i == 0);
+        QVERIFY(!encoded.isEmpty());
+        const auto decoded = decoder.decode(encoded);
+        QCOMPARE(decoded.size(), image.size());
+        QVERIFY(std::abs(decoded.pixelColor(640, 360).red() - (30 + i)) < 10);
+    }
+    qInfo() << "720p target" << fps << "FPS:" << fps << "immediate codec roundtrips in" << elapsed.elapsed() << "ms";
+}
+
+void TestVp8Rtp::h264DecodeAndDavePacketization()
+{
+    // Own fixture: three 320x180 solid-color frames encoded with FFmpeg/x264.
+    // Embedded to require only a decoder on CI, not an H264 encoder.
+    const auto fixture = QByteArray::fromBase64("AAAAAQkQAAAAAWdCwA3aBQZ+fARAAAADAEAAAA8jxQqoAAAAAWjOD8gAAAEGBf//V9xF6b3m2Ui3lizYINkj7u94MjY0IC0gY29yZSAxNjQgcjMxMDggMzFlMTlmOSAtIEguMjY0L01QRUctNCBBVkMgY29kZWMgLSBDb3B5bGVmdCAyMDAzLTIwMjMgLSBodHRwOi8vd3d3LnZpZGVvbGFuLm9yZy94MjY0Lmh0bWwgLSBvcHRpb25zOiBjYWJhYz0wIHJlZj0xIGRlYmxvY2s9MDowOjAgYW5hbHlzZT0wOjAgbWU9ZGlhIHN1Ym1lPTAgcHN5PTEgcHN5X3JkPTEuMDA6MC4wMCBtaXhlZF9yZWY9MCBtZV9yYW5nZT0xNiBjaHJvbWFfbWU9MSB0cmVsbGlzPTAgOHg4ZGN0PTAgY3FtPTAgZGVhZHpvbmU9MjEsMTEgZmFzdF9wc2tpcD0xIGNocm9tYV9xcF9vZmZzZXQ9MCB0aHJlYWRzPTMgbG9va2FoZWFkX3RocmVhZHM9MyBzbGljZWRfdGhyZWFkcz0xIHNsaWNlcz0zIG5yPTAgZGVjaW1hdGU9MSBpbnRlcmxhY2VkPTAgYmx1cmF5X2NvbXBhdD0wIGNvbnN0cmFpbmVkX2ludHJhPTAgYmZyYW1lcz0wIHdlaWdodHA9MCBrZXlpbnQ9MzAga2V5aW50X21pbj0zIHNjZW5lY3V0PTAgaW50cmFfcmVmcmVzaD0wIHJjPWNyZiBtYnRyZWU9MCBjcmY9MjMuMCBxY29tcD0wLjYwIHFwbWluPTAgcXBtYXg9NjkgcXBzdGVwPTQgaXBfcmF0aW89MS40MCBhcT0wAIAAAAFliIQ6EYoAAg7xwABBgjgACANJycnJycnJycnJycnJycnJycnJ1111111111111111111111111111111111111111111111111111111111114AAAAWUCiIhDoRigACDvHAAEGCOAAIA0nJycnJycnJycnJycnJycnJycnXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXgAAAWUBQiIQ6EYoAAg7xwABBgjgACANJycnJycnJycnJycnJycnJycnJ1111111111111111111111111111111111111111111111111111111111114AAAAABCTAAAAFBmiAqgKMAAAFBAomiAqgKMAAAAUEBQmiAqgKMAAAAAQkwAAABQZpAKoCjAAABQQKJpAKoCjAAAAFBAUJpAKoCjA==");
+    QList<QByteArray> nalus;
+    for (int i = 0; i + 3 < fixture.size();) {
+        int prefix = 0;
+        if (fixture.mid(i, 4) == QByteArray::fromHex("00000001")) prefix = 4;
+        else if (fixture.mid(i, 3) == QByteArray::fromHex("000001")) prefix = 3;
+        if (!prefix) { ++i; continue; }
+        const int start = i + prefix;
+        int end = start;
+        while (end + 3 < fixture.size() && fixture.mid(end, 3) != QByteArray::fromHex("000001") &&
+               fixture.mid(end, 4) != QByteArray::fromHex("00000001")) ++end;
+        if (end + 3 >= fixture.size()) end = int(fixture.size());
+        nalus.append(fixture.mid(start, end - start));
+        i = end;
+    }
+    QList<QByteArray> frames;
+    QByteArray frame;
+    for (const auto &nal : nalus) {
+        if ((quint8(nal[0]) & 0x1f) == 9 && !frame.isEmpty()) { frames.append(frame); frame.clear(); }
+        frame += QByteArray::fromHex("00000001") + nal;
+    }
+    if (!frame.isEmpty()) frames.append(frame);
+    QCOMPARE(frames.size(), 3);
+    struct Ratchet : discord::dave::IKeyRatchet {
+        discord::dave::EncryptionKey GetKey(discord::dave::KeyGeneration g) noexcept override
+        { return discord::dave::EncryptionKey(std::vector<uint8_t>(16, uint8_t(42 + g))); }
+        void DeleteKey(discord::dave::KeyGeneration) noexcept override {}
+    };
+    auto enc = discord::dave::CreateEncryptor(); auto dec = discord::dave::CreateDecryptor();
+    enc->SetPassthroughMode(false); enc->SetKeyRatchet(std::make_unique<Ratchet>());
+    enc->AssignSsrcToCodec(7, discord::dave::Codec::H264);
+    dec->TransitionToKeyRatchet(std::make_unique<Ratchet>());
+    dec->TransitionToPassthroughMode(false, std::chrono::seconds(0));
+    Acheron::Core::Media::RealtimeVp8 decoder;
+    QVERIFY(decoder.openDecoder(QStringLiteral("H264")));
+    H264Reassembler receiver;
+    uint16_t sequence = 65000;
+    for (int f = 0; f < frames.size(); ++f) {
+        const auto &input = frames[f];
+        QByteArray encrypted(int(enc->GetMaxCiphertextByteSize(discord::dave::MediaType::Video, input.size())), '\0');
+        size_t written = 0;
+        QCOMPARE(enc->Encrypt(discord::dave::MediaType::Video, 7,
+            {reinterpret_cast<const uint8_t *>(input.constData()), size_t(input.size())},
+            {reinterpret_cast<uint8_t *>(encrypted.data()), size_t(encrypted.size())}, &written), discord::dave::IEncryptor::Success);
+        encrypted.resize(int(written));
+        QList<QByteArray> packets;
+        int pos = 0;
+        while (pos < encrypted.size()) {
+            QCOMPARE(encrypted.mid(pos, 4), QByteArray::fromHex("00000001"));
+            int end = encrypted.indexOf(QByteArray::fromHex("00000001"), pos + 4);
+            if (end < 0) end = int(encrypted.size());
+            const auto nal = encrypted.mid(pos + 4, end - pos - 4);
+            if (nal.size() <= 80) packets.append(nal);
+            else {
+                for (int offset = 1; offset < nal.size(); offset += 78) {
+                    const bool last = offset + 78 >= nal.size();
+                    QByteArray p;
+                    p += char((quint8(nal[0]) & 0xe0) | 28);
+                    p += char((offset == 1 ? 0x80 : 0) | (last ? 0x40 : 0) | (quint8(nal[0]) & 0x1f));
+                    p += nal.mid(offset, 78);
+                    packets.append(p);
+                }
+            }
+            pos = end;
+        }
+        std::optional<QByteArray> assembled;
+        // Parameter/AUD packets lead, remaining fragmented data is reversed.
+        int lead = 0;
+        while (lead < packets.size() && (quint8(packets[lead][0]) & 0x1f) != 28) {
+            auto ready = receiver.push(sequence + lead, 90000 + f * 3000, lead == packets.size() - 1, packets[lead], f);
+            if (ready) assembled = std::move(ready);
+            ++lead;
+        }
+        for (int p = int(packets.size()) - 1; p >= lead; --p) {
+            auto ready = receiver.push(sequence + p, 90000 + f * 3000, p == packets.size() - 1, packets[p], f);
+            if (ready) assembled = std::move(ready);
+        }
+        QVERIFY(assembled);
+        QByteArray plain(int(dec->GetMaxPlaintextByteSize(discord::dave::MediaType::Video, assembled->size())), '\0');
+        QCOMPARE(dec->Decrypt(discord::dave::MediaType::Video,
+            {reinterpret_cast<const uint8_t *>(assembled->constData()), size_t(assembled->size())},
+            {reinterpret_cast<uint8_t *>(plain.data()), size_t(plain.size())}, &written), discord::dave::IDecryptor::Success);
+        plain.resize(int(written));
+        QCOMPARE(plain, input);
+        const auto image = decoder.decode(plain);
+        QCOMPARE(image.size(), QSize(320, 180));
+        const auto pixel = image.pixelColor(160, 90);
+        QVERIFY(std::abs(pixel.red() - 120) < 10);
+        QVERIFY(std::abs(pixel.green() - 60) < 10);
+        QVERIFY(std::abs(pixel.blue() - 200) < 10);
+        sequence += uint16_t(packets.size());
+    }
+    QVERIFY(decoder.openDecoder(QStringLiteral("VP8")));
+    QVERIFY(decoder.openDecoder(QStringLiteral("H264")));
+    QVERIFY(!decoder.openDecoder(QStringLiteral("AV1")));
 }
 #endif
 QTEST_GUILESS_MAIN(TestVp8Rtp)

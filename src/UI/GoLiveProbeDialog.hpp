@@ -22,7 +22,7 @@ namespace Acheron::UI {
 class ProbeMediaWorker;
 struct ProbeFrameMailbox;
 
-// Experimental VP8/DAVE viewer and explicit, user-selected monitor sharing.
+// Experimental VP8/H264/DAVE viewer and explicit, user-selected monitor sharing.
 // The protocol test card/tone is an optional diagnostic, not the default source.
 class GoLiveProbeDialog : public QDialog
 {
@@ -52,11 +52,17 @@ private:
     QCheckBox *sound = nullptr;
     QComboBox *streams = nullptr;
     QComboBox *screens = nullptr;
+    QComboBox *frameRate = nullptr;
     QList<QPointer<QScreen>> screenList;
     QPointer<QScreen> capturedScreen;
     QTimer *captureTimer = nullptr;
     QLabel *preview = nullptr;
     QLabel *sharingStatus = nullptr;
+    QLabel *publisherStatus = nullptr;
+    QLabel *publisherStats = nullptr;
+    QLabel *viewerStats = nullptr;
+    int publishingFps = 30;
+    qint64 lastPreviewAtMs = 0;
     QPushButton *share = nullptr;
     QPushButton *testCard = nullptr;
     std::shared_ptr<Core::Media::LatestVideoFrame> captureFrames;

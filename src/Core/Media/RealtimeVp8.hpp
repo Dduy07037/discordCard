@@ -7,7 +7,7 @@
 
 namespace Acheron::Core::Media {
 
-// Experimental stream codec. No delayed/B frames or internal encode backlog.
+// VP8 encoder and negotiated VP8/H264 stream decoder.
 class RealtimeVp8
 {
 public:
@@ -16,7 +16,8 @@ public:
     RealtimeVp8(const RealtimeVp8 &) = delete;
     RealtimeVp8 &operator=(const RealtimeVp8 &) = delete;
     bool openEncoder(QSize size = QSize(640, 360), int fps = 15, int bitrate = 600000);
-    bool openDecoder();
+    bool openDecoder(const QString &codecName = QStringLiteral("VP8"));
+    static bool hasDecoder(const QString &codecName);
     QByteArray encode(const QImage &image, bool keyframe);
     QImage decode(const QByteArray &frame);
     QString error() const;

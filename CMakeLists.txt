@@ -266,6 +266,7 @@ if(ENABLE_VOICE)
         src/Discord/Voice/VoiceClient.cpp
         src/Discord/Voice/RtpPacket.cpp
         src/Discord/Voice/Vp8Rtp.cpp
+        src/Discord/Voice/H264Rtp.cpp
         src/Discord/Voice/VoiceEncryption.cpp
         src/Discord/Voice/DaveSession.cpp
         src/Core/Audio/VoiceManager.cpp
@@ -369,7 +370,7 @@ if(BUILD_TESTS)
         target_include_directories(TestGoLiveSignaling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME GoLiveSignalingTests COMMAND TestGoLiveSignaling)
 
-        qt_add_executable(TestVp8Rtp tests/tst_Vp8Rtp.cpp src/Discord/Voice/Vp8Rtp.cpp)
+        qt_add_executable(TestVp8Rtp tests/tst_Vp8Rtp.cpp src/Discord/Voice/Vp8Rtp.cpp src/Discord/Voice/H264Rtp.cpp)
         target_link_libraries(TestVp8Rtp PRIVATE Qt::Core Qt::Gui Qt::Test libdave MLSPP::mlspp)
         target_include_directories(TestVp8Rtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         if(TARGET ffmpeg)
@@ -378,6 +379,30 @@ if(BUILD_TESTS)
             target_compile_definitions(TestVp8Rtp PRIVATE TEST_VP8_CODEC)
         endif()
         add_test(NAME Vp8RtpTests COMMAND TestVp8Rtp)
+
+        qt_add_executable(TestVoiceGateway tests/tst_VoiceGateway.cpp
+            src/Discord/Voice/VoiceGateway.cpp src/Discord/CurlUtils.cpp
+            src/Discord/Voice/VoiceClient.cpp src/Discord/Voice/UdpTransport.cpp
+            src/Discord/Voice/Socks5UdpAssociation.cpp src/Discord/Voice/VoiceEncryption.cpp
+            src/Discord/Voice/RtpPacket.cpp src/Discord/Voice/Vp8Rtp.cpp src/Discord/Voice/H264Rtp.cpp
+            src/Discord/Voice/DaveSession.cpp
+            src/Discord/ClientIdentity.cpp src/Core/ProxyConfig.cpp
+            src/Core/Snowflake.cpp src/Core/Logging.cpp)
+        target_link_libraries(TestVoiceGateway PRIVATE Qt::Core Qt::Gui Qt::Network Qt::Test CURL::libcurl libdave MLSPP::mlspp ${SODIUM_TARGET})
+        target_include_directories(TestVoiceGateway PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        target_compile_definitions(TestVoiceGateway PRIVATE NOMINMAX)
+        # This offline protocol test links the same curl DLL as the app, but
+        # runs before the workflow's artifact packaging/deployment steps.
+        if(WIN32 AND CURL_LIBRARY)
+            get_filename_component(_test_curl_dir "${CURL_LIBRARY}" DIRECTORY)
+            file(GLOB _test_curl_dlls "${_test_curl_dir}/*.dll")
+            if(_test_curl_dlls)
+                add_custom_command(TARGET TestVoiceGateway POST_BUILD
+                    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${_test_curl_dlls}
+                        "$<TARGET_FILE_DIR:TestVoiceGateway>")
+            endif()
+        endif()
+        add_test(NAME VoiceGatewayTests COMMAND TestVoiceGateway)
     endif()
 endif()
 
@@ -396,7 +421,7 @@ if (MSVC)
     if(BUILD_TESTS)
         set(ACHERON_TEST_TARGETS TestMarkdown TestUnicodeEmoji TestFrecency TestProto TestProxy TestActivitySummary)
         if(ENABLE_VOICE)
-            list(APPEND ACHERON_TEST_TARGETS TestVoice TestGoLiveSignaling TestVp8Rtp)
+            list(APPEND ACHERON_TEST_TARGETS TestVoice TestGoLiveSignaling TestVp8Rtp TestVoiceGateway)
         endif()
         foreach(test_target IN LISTS ACHERON_TEST_TARGETS)
             target_link_options(${test_target} PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL>)

@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QTimer>
+#include <QSet>
 
 #include <atomic>
 #include <array>
@@ -18,6 +19,7 @@
 #include "Core/Audio/AudioSendQueue.hpp"
 #include "VoiceEntities.hpp"
 #include "Vp8Rtp.hpp"
+#include "H264Rtp.hpp"
 
 namespace Acheron {
 namespace Discord {
@@ -65,9 +67,13 @@ public:
 
     void setSpeaking(bool speaking);
     // Experimental Go Live adapter: call before start(), on its own worker.
-    void configureVideoSession(Core::Snowflake daveGroupId, bool publisher, bool desktop = false);
+    void configureVideoSession(Core::Snowflake daveGroupId, bool publisher, bool desktop = false,
+                               int fps = 30, bool h264Decode = false);
     bool sendVideoFrame(const QByteArray &vp8Frame, uint32_t timestamp);
+    bool canSendVideoFrame() const;
     void advertiseVideo();
+    void requestVideoKeyframe(quint32 ssrc);
+    QJsonObject videoDiagnostics() const;
 
     bool isDaveEnabled() const;
     void requestVerificationCode(Core::Snowflake targetUserId, std::function<void(const QString &)> callback);
@@ -85,6 +91,8 @@ signals:
 
     void videoReceived(quint32 ssrc, uint32_t timestamp, const QByteArray &vp8Frame);
     void videoError(const QString &reason);
+    void videoCodecChanged(const QString &codec);
+    void videoKeyframeRequested();
     void privacyCodeChanged(const QString &code);
     void sendDiagnosticsUpdated(const QJsonObject &stats);
 
@@ -93,6 +101,7 @@ private slots:
     void onGatewayDisconnected(VoiceCloseCode code, const QString &reason);
     void onGatewayReady(const VoiceReady &data);
     void onSessionDescription(const SessionDescription &desc);
+    void onSessionUpdate(const QJsonObject &data);
     void onSpeaking(const SpeakingData &data);
     void onClientsConnect(const QStringList &userIds);
     void onClientConnect(const ClientConnectData &data);
@@ -107,6 +116,7 @@ private:
     void sendSilence();
     void cleanupTransport();
     void ensureDaveSession(uint16_t protocolVersion);
+    bool selectVideoCodec(const QString &codec);
 
 private:
     bool videoSession = false;
@@ -114,9 +124,16 @@ private:
     Core::Snowflake daveGroupId;
     quint32 localVideoSsrc = 0;
     bool desktopVideo = false;
+    bool canDecodeH264 = false;
+    int videoFps = 30;
+    QString selectedVideoCodec;
+    quint64 videoPackets = 0, videoFrames = 0, videoSentFrames = 0, videoDecryptFailures = 0, videoTransportFailures = 0, unknownVideoSources = 0;
+    QSet<quint32> remoteVideoSsrcs;
+    QHash<quint32, qint64> lastKeyframeRequests;
     quint32 localRtxSsrc = 0;
     uint16_t videoSequence = 0;
     QHash<quint32, Vp8Reassembler> videoAssemblers;
+    QHash<quint32, H264Reassembler> h264Assemblers;
     QHash<quint32, quint32> rtxToVideoSsrc;
     QList<QByteArray> videoFragments;
     uint32_t pendingVideoTimestamp = 0;

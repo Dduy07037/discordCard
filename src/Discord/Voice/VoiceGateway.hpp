@@ -9,6 +9,7 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <condition_variable>
 
 #include "Core/ProxyConfig.hpp"
 #include "Core/Snowflake.hpp"
@@ -34,7 +35,8 @@ public:
 
     void sendSelectProtocol(const QString &address, int port, const QString &mode);
     void sendSpeaking(int flags, int delay, quint32 ssrc);
-    void setVideoSession(bool enabled) { videoSession = enabled; }
+    void setVideoSession(bool enabled, bool publisher = false, bool h264Decode = false)
+    { videoSession = enabled; videoPublisher = publisher; canDecodeH264 = h264Decode; }
     void sendVideoState(const QJsonObject &data);
     void sendMediaSinkWants(const QJsonObject &data);
     void sendBinaryPayload(int opcode, const QByteArray &data);
@@ -51,6 +53,7 @@ signals:
     void helloReceived(int heartbeatInterval);
     void readyReceived(const VoiceReady &data);
     void sessionDescriptionReceived(const SessionDescription &data);
+    void sessionUpdated(const QJsonObject &data);
     void speakingReceived(const SpeakingData &data);
     void clientConnected(const ClientConnectData &data);
     void clientsConnected(const QStringList &userIds);
@@ -92,6 +95,8 @@ private:
 
 private:
     bool videoSession = false;
+    bool videoPublisher = false;
+    bool canDecodeH264 = false;
     QString endpoint;
     Core::Snowflake serverId;
     Core::Snowflake channelId;

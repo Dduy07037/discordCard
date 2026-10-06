@@ -5,6 +5,7 @@
 #include "RtpPacket.hpp"
 
 #include "DaveSession.hpp"
+#include <QtEndian>
 
 #include "Core/Audio/IAudioBackend.hpp"
 #include "Core/Logging.hpp"
@@ -83,12 +84,13 @@ void VoiceClient::start()
 
     gateway = new VoiceGateway(endpoint, serverId, channelId, userId, sessionId, token, proxy, this);
 
-    gateway->setVideoSession(videoSession);
+    gateway->setVideoSession(videoSession, videoPublisher, canDecodeH264);
 
     connect(gateway, &VoiceGateway::connected, this, &VoiceClient::onGatewayConnected);
     connect(gateway, &VoiceGateway::disconnected, this, &VoiceClient::onGatewayDisconnected);
     connect(gateway, &VoiceGateway::readyReceived, this, &VoiceClient::onGatewayReady);
     connect(gateway, &VoiceGateway::sessionDescriptionReceived, this, &VoiceClient::onSessionDescription);
+    connect(gateway, &VoiceGateway::sessionUpdated, this, &VoiceClient::onSessionUpdate);
     connect(gateway, &VoiceGateway::speakingReceived, this, &VoiceClient::onSpeaking);
     connect(gateway, &VoiceGateway::clientConnected, this, &VoiceClient::onClientConnect);
     connect(gateway, &VoiceGateway::clientsConnected, this, &VoiceClient::onClientsConnect);
@@ -143,9 +145,6 @@ void VoiceClient::start()
 
 void VoiceClient::stop()
 {
-    if (currentState == State::Disconnected)
-        return;
-
     if (gateway) {
         gateway->hardStop();
         delete gateway;
@@ -173,6 +172,11 @@ void VoiceClient::cleanupTransport()
     }
     videoFragments.clear();
     videoAssemblers.clear();
+    h264Assemblers.clear();
+    lastKeyframeRequests.clear();
+    selectedVideoCodec.clear();
+    remoteVideoSsrcs.clear();
+    videoPackets = videoFrames = videoSentFrames = videoDecryptFailures = videoTransportFailures = unknownVideoSources = 0;
     rtxToVideoSsrc.clear();
     videoSequence = 0;
     if (keepaliveTimer) {
@@ -267,8 +271,7 @@ void VoiceClient::onSessionDescription(const SessionDescription &desc)
     qCInfo(LogVoice) << "Session established: mode =" << desc.mode
                      << "key length =" << desc.secretKey->size();
 
-    if (videoSession && desc.videoCodec.get().compare("VP8", Qt::CaseInsensitive) != 0) {
-        emit videoError(tr("The stream server did not select VP8."));
+    if (videoSession && !selectVideoCodec(desc.videoCodec.get())) {
         stop();
         return;
     }
@@ -415,12 +418,38 @@ void VoiceClient::sendAudio(const QByteArray &opusData, qint64 capturedAtMs)
     lastAudioSendTime = now;
 }
 
-void VoiceClient::configureVideoSession(Core::Snowflake groupId, bool publisher, bool desktop)
+bool VoiceClient::selectVideoCodec(const QString &name)
+{
+    const auto codec = name.toUpper();
+    if (codec != QStringLiteral("VP8") &&
+        (videoPublisher || !canDecodeH264 || codec != QStringLiteral("H264"))) {
+        emit videoError(tr("Unsupported stream codec: %1. This build supports VP8 and H264 viewing.").arg(name));
+        return false;
+    }
+    if (selectedVideoCodec == codec) return true;
+    selectedVideoCodec = codec;
+    videoAssemblers.clear();
+    h264Assemblers.clear();
+    lastKeyframeRequests.clear();
+    emit videoCodecChanged(codec);
+    return true;
+}
+
+void VoiceClient::onSessionUpdate(const QJsonObject &data)
+{
+    if (!videoSession || !data.contains("video_codec")) return;
+    if (!selectVideoCodec(data.value("video_codec").toString())) { stop(); return; }
+    if (!videoPublisher) advertiseVideo();
+}
+
+void VoiceClient::configureVideoSession(Core::Snowflake groupId, bool publisher, bool desktop, int fps, bool h264Decode)
 {
     Q_ASSERT(currentState == State::Disconnected);
     videoSession = true;
     videoPublisher = publisher;
     desktopVideo = desktop;
+    videoFps = qBound(15, fps, 60);
+    canDecodeH264 = h264Decode;
     daveGroupId = groupId;
 }
 
@@ -429,7 +458,11 @@ void VoiceClient::advertiseVideo()
     if (!gateway || !videoSession || currentState != State::Connected)
         return;
     if (!videoPublisher) {
-        gateway->sendMediaSinkWants({{"any", 100}});
+        QJsonObject wants{{"any", 100}};
+        for (const auto ssrc : remoteVideoSsrcs)
+            wants.insert(QString::number(ssrc), 100);
+        gateway->sendMediaSinkWants(wants);
+        for (const auto ssrc : remoteVideoSsrcs) requestVideoKeyframe(ssrc);
         return;
     }
     if (!localVideoSsrc) {
@@ -438,11 +471,46 @@ void VoiceClient::advertiseVideo()
     }
     const QJsonObject stream{{"type", "video"}, {"rid", "100"}, {"ssrc", qint64(localVideoSsrc)},
         {"rtx_ssrc", qint64(localRtxSsrc)}, {"active", true}, {"quality", 100},
-        {"max_bitrate", desktopVideo ? 1800000 : 600000}, {"max_framerate", 15},
+        {"max_bitrate", desktopVideo ? (videoFps > 30 ? 4500000 : 3000000) : 600000},
+        {"max_framerate", desktopVideo ? videoFps : 15},
         {"max_resolution", QJsonObject{{"type", "fixed"}, {"width", desktopVideo ? 1280 : 640},
                                       {"height", desktopVideo ? 720 : 360}}}};
     gateway->sendVideoState({{"audio_ssrc", qint64(localSsrc)}, {"video_ssrc", qint64(localVideoSsrc)},
         {"rtx_ssrc", qint64(localRtxSsrc)}, {"streams", QJsonArray{stream}}});
+}
+
+void VoiceClient::requestVideoKeyframe(quint32 ssrc)
+{
+    if (!videoSession || videoPublisher || !remoteVideoSsrcs.contains(ssrc) ||
+        currentState != State::Connected || !encryption || !udpTransport) return;
+    const qint64 now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (lastKeyframeRequests.contains(ssrc) && now - lastKeyframeRequests.value(ssrc) < 1000) return;
+    // Native RTCP uses eight clear authenticated bytes. The target SSRC is
+    // transport encrypted; RFC 4585 PLI carries no FCI body.
+    QByteArray header = QByteArray::fromHex("81ce000200000000");
+    qToBigEndian(localSsrc, reinterpret_cast<uchar *>(header.data() + 4));
+    QByteArray body(4, '\0');
+    qToBigEndian(ssrc, reinterpret_cast<uchar *>(body.data()));
+    const auto encrypted = encryption->encrypt(header, body);
+    if (encrypted.isEmpty()) return;
+    udpTransport->send(header + encrypted);
+    lastKeyframeRequests.insert(ssrc, now);
+}
+
+QJsonObject VoiceClient::videoDiagnostics() const
+{
+    return {{"codec", selectedVideoCodec}, {"dave_ready", isDaveEnabled()},
+        {"sources", remoteVideoSsrcs.size()}, {"packets", qint64(videoPackets)},
+        {"frames", qint64(videoFrames)}, {"transport_errors", qint64(videoTransportFailures)},
+        {"sent_frames", qint64(videoSentFrames)},
+        {"dave_errors", qint64(videoDecryptFailures)}, {"unknown_sources", qint64(unknownVideoSources)}};
+}
+
+bool VoiceClient::canSendVideoFrame() const
+{
+    return videoSession && videoPublisher && localVideoSsrc && isDaveEnabled() &&
+        currentState == State::Connected && encryption && udpTransport && videoFragments.isEmpty();
 }
 
 bool VoiceClient::sendVideoFrame(const QByteArray &frame, uint32_t timestamp)
@@ -476,6 +544,7 @@ bool VoiceClient::sendVideoFrame(const QByteArray &frame, uint32_t timestamp)
             if (nowMs - pendingVideoAtMs > 150 || !encryption || !udpTransport) {
                 videoFragments.clear();
                 videoPacer->stop();
+                emit videoKeyframeRequested();
                 return;
             }
             // Bounded pacing, never queue another encoded frame behind this one.
@@ -494,6 +563,7 @@ bool VoiceClient::sendVideoFrame(const QByteArray &frame, uint32_t timestamp)
             if (videoFragmentIndex >= videoFragments.size()) {
                 videoFragments.clear();
                 videoPacer->stop();
+                ++videoSentFrames;
             }
         });
     }
@@ -541,11 +611,24 @@ void VoiceClient::onDatagram(const QByteArray &data)
     if (((p[0] >> 6) & 0x03) != 2)
         return;
 
-    // VP8 and its RTX are accepted only on the separate stream session.
+    // RTP/RTCP are multiplexed. A feedback packet is not video RTP.
+    if (p[1] >= 192 && p[1] <= 223) {
+        if (videoSession && videoPublisher && p[1] == 206 && (p[0] & 0x1f) == 1 && encryption) {
+            const auto body = encryption->decrypt(data.left(8), data.mid(8));
+            if (body.size() == 4 && qFromBigEndian<quint32>(reinterpret_cast<const uchar *>(body.constData())) == localVideoSsrc)
+                emit videoKeyframeRequested();
+        }
+        return;
+    }
+
+    // These payload numbers match our advertised native UDP codec list.
     const uint8_t payloadType = p[1] & 0x7F;
-    const bool video = videoSession && (payloadType == 103 || payloadType == 104);
+    const bool h264 = selectedVideoCodec == QStringLiteral("H264");
+    const bool video = videoSession && (h264 ? (payloadType == 101 || payloadType == 102)
+                                                         : (payloadType == 103 || payloadType == 104));
     if (payloadType != 120 && !video)
         return;
+    if (video) ++videoPackets;
 
     // rtp header and extension header are unencrypted and used for aad in rtpsize.
     // account for CSRC entries between fixed header and extension header.
@@ -572,6 +655,7 @@ void VoiceClient::onDatagram(const QByteArray &data)
 
     QByteArray decrypted = encryption->decrypt(rtpHeaderBytes, encryptedSection);
     if (decrypted.isEmpty()) {
+        if (video) ++videoTransportFailures;
         qCDebug(LogVoice) << "Decrypt failed: SSRC =" << header.ssrc
                           << "seq =" << header.sequence
                           << "pktSize =" << data.size()
@@ -602,7 +686,7 @@ void VoiceClient::onDatagram(const QByteArray &data)
     if (video) {
         quint32 mediaSsrc = header.ssrc;
         uint16_t sequence = header.sequence;
-        if (payloadType == 104) {
+        if (payloadType == 104 || payloadType == 102) {
             if (decrypted.size() < 3 || !ssrcToUserIdMap.contains(header.ssrc))
                 return;
             sequence = (quint8(decrypted[0]) << 8) | quint8(decrypted[1]);
@@ -612,23 +696,32 @@ void VoiceClient::onDatagram(const QByteArray &data)
             if (!mediaSsrc)
                 return;
         }
-        if (!videoAssemblers.contains(mediaSsrc) && videoAssemblers.size() >= 4)
-            return;
+        const auto owner = ssrcToUserIdMap.value(mediaSsrc, 0);
+        if (!owner) { ++unknownVideoSources; return; }
+        if ((!h264 && !videoAssemblers.contains(mediaSsrc) && videoAssemblers.size() >= 4) ||
+            (h264 && !h264Assemblers.contains(mediaSsrc) && h264Assemblers.size() >= 4)) return;
         const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count();
-        auto frame = videoAssemblers[mediaSsrc].push(sequence, header.timestamp,
-                                                   header.marker, decrypted, nowMs);
+        const auto dropsBefore = h264 ? h264Assemblers[mediaSsrc].droppedFrames() : videoAssemblers[mediaSsrc].droppedFrames();
+        auto frame = h264 ? h264Assemblers[mediaSsrc].push(sequence, header.timestamp, header.marker, decrypted, nowMs)
+                         : videoAssemblers[mediaSsrc].push(sequence, header.timestamp, header.marker, decrypted, nowMs);
+        const auto dropsAfter = h264 ? h264Assemblers[mediaSsrc].droppedFrames() : videoAssemblers[mediaSsrc].droppedFrames();
+        if (dropsAfter > dropsBefore) requestVideoKeyframe(mediaSsrc);
         if (!frame || !daveSession)
             return;
-        auto *dec = daveSession->getOrCreateDecryptor(mediaSsrc, ssrcToUserIdMap.value(mediaSsrc, 0));
+        auto *dec = daveSession->getOrCreateDecryptor(mediaSsrc, owner);
         QByteArray plaintext(int(dec->GetMaxPlaintextByteSize(discord::dave::MediaType::Video, frame->size())), '\0');
         size_t written = 0;
         const auto result = dec->Decrypt(discord::dave::MediaType::Video,
             discord::dave::ArrayView<const uint8_t>(reinterpret_cast<const uint8_t *>(frame->constData()), frame->size()),
             discord::dave::ArrayView<uint8_t>(reinterpret_cast<uint8_t *>(plaintext.data()), plaintext.size()), &written);
-        if (result != discord::dave::IDecryptor::Success)
+        if (result != discord::dave::IDecryptor::Success) {
+            ++videoDecryptFailures;
+            requestVideoKeyframe(mediaSsrc);
             return;
+        }
         plaintext.resize(int(written));
+        ++videoFrames;
         emit videoReceived(mediaSsrc, header.timestamp, plaintext);
         return;
     }
@@ -731,19 +824,50 @@ void VoiceClient::onClientConnect(const ClientConnectData &data)
     if (data.userId.hasValue() && data.userId->isValid()) {
         std::string uid = std::to_string(data.userId.get());
         connectedUserIds.insert(uid);
+        QSet<quint32> announced;
+        if (data.videoSsrc.get()) announced.insert(data.videoSsrc);
+        for (const auto &entry : data.streams) {
+            const auto ssrc = quint32(entry.toObject().value("ssrc").toDouble());
+            if (ssrc) announced.insert(ssrc);
+        }
+        // Preserve live reassembly and PLI throttling on repeated Video state
+        // messages; retire only this user's obsolete sources.
+        for (auto it = remoteVideoSsrcs.begin(); it != remoteVideoSsrcs.end();) {
+            if (ssrcToUserIdMap.value(*it, 0) == quint64(data.userId.get()) && !announced.contains(*it)) {
+                videoAssemblers.remove(*it);
+                h264Assemblers.remove(*it);
+                lastKeyframeRequests.remove(*it);
+                ssrcToUserIdMap.remove(*it);
+                it = remoteVideoSsrcs.erase(it);
+            } else ++it;
+        }
+        for (auto it = rtxToVideoSsrc.begin(); it != rtxToVideoSsrc.end();) {
+            if (ssrcToUserIdMap.value(it.key(), 0) == quint64(data.userId.get()) && !announced.contains(it.value())) {
+                ssrcToUserIdMap.remove(it.value());
+                ssrcToUserIdMap.remove(it.key());
+                it = rtxToVideoSsrc.erase(it);
+            } else ++it;
+        }
         if (data.audioSsrc.get() != 0)
             ssrcToUserIdMap.insert(data.audioSsrc, data.userId.get());
-        if (data.videoSsrc.get() != 0)
+        if (data.videoSsrc.get() != 0) {
             ssrcToUserIdMap.insert(data.videoSsrc, data.userId.get());
+            remoteVideoSsrcs.insert(data.videoSsrc);
+        }
         for (const auto &entry : data.streams) {
             const auto stream = entry.toObject();
             const auto videoSsrc = quint32(stream.value("ssrc").toDouble());
             const auto rtxSsrc = quint32(stream.value("rtx_ssrc").toDouble());
             if (videoSsrc) {
                 ssrcToUserIdMap.insert(videoSsrc, data.userId.get());
-                if (rtxSsrc) {
-                    ssrcToUserIdMap.insert(rtxSsrc, data.userId.get());
-                    rtxToVideoSsrc.insert(rtxSsrc, videoSsrc);
+                if (stream.value("active").toBool(true)) remoteVideoSsrcs.insert(videoSsrc);
+                else remoteVideoSsrcs.remove(videoSsrc);
+                // Native Discord omits rtx_ssrc on some layers; its documented
+                // default is the primary SSRC plus one, unless explicitly set.
+                const auto repairSsrc = rtxSsrc ? rtxSsrc : videoSsrc + 1;
+                if (repairSsrc) {
+                    ssrcToUserIdMap.insert(repairSsrc, data.userId.get());
+                    rtxToVideoSsrc.insert(repairSsrc, videoSsrc);
                 }
             }
         }
@@ -754,7 +878,7 @@ void VoiceClient::onClientConnect(const ClientConnectData &data)
                     daveSession->applyKeyRatchetForSsrc(it.key(), it.value());
         }
         if (videoSession && !videoPublisher)
-            gateway->sendMediaSinkWants({{"any", 100}});
+            advertiseVideo();
     }
     emit clientConnected(data);
 }
@@ -770,6 +894,9 @@ void VoiceClient::onClientDisconnect(Core::Snowflake uid)
     for (auto it = ssrcToUserIdMap.begin(); it != ssrcToUserIdMap.end();) {
         if (it.value() == static_cast<quint64>(uid)) {
             videoAssemblers.remove(it.key());
+            h264Assemblers.remove(it.key());
+            remoteVideoSsrcs.remove(it.key());
+            lastKeyframeRequests.remove(it.key());
             rtxToVideoSsrc.remove(it.key());
             it = ssrcToUserIdMap.erase(it);
         } else {

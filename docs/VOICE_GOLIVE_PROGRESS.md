@@ -23,7 +23,7 @@ Implemented:
 - Session ownership/context validation, either arrival order of CREATE/SERVER_UPDATE, duplicate suppression, timeout, token replacement and cleanup on leaving voice.
 - Separate native UDP RTC session using the existing transport encryption and libdave implementation. Normal voice continues in its own workers.
 - Explicit monitor selection, one-shot local preview, and real desktop capture through Qt QScreen on supported desktops. Capture starts only on Share, stops on Stop/close/leave/monitor removal, and is never resumed automatically after the stream is deleted. A single replaceable frame connects GUI capture to the separate encoding worker; images older than 150 ms are discarded.
-- VP8-only negotiation: monitor video is letterboxed to 1280×720 at 15 fps / 1.8 Mbps. The optional diagnostic test card stays at 640×360 / 15 fps / 600 kbps. There is no system-audio or microphone capture in the stream publisher; the main voice call remains separate.
+- VP8 publishing and VP8/H264 receive negotiation: monitor video is letterboxed to 1280×720, with 15/30/60 FPS targets (30 default) and up to 4.5 Mbps. Capture and encode timers use the selected rate; actual completed-frame FPS is displayed. The optional diagnostic test card stays at 640×360 / 15 fps / 600 kbps. There is no system-audio or microphone capture in the stream publisher; the main voice call remains separate.
 - Watchers are listed by display name when available; watching and sharing have separate Stop controls. A receive worker decodes VP8 and optionally plays stream audio.
 - DAVE encryption of a complete VP8 frame **before** RTP fragmentation; full reassembly **before** DAVE decryption. No plaintext outbound video during MLS setup.
 - Packet pacing with one bounded pending frame; bounded reassembly, deadline expiry, sequence/timestamp wrap handling, extension parsing, RTX mapping from session metadata, duplicate/late-frame suppression and latest-image rendering.
@@ -32,8 +32,8 @@ Limitations that prevent treating this as production Go Live:
 
 - Official Discord send/receive interoperability has not been exercised here. No signed-in Discord account or second real client is available in the build environment.
 - Stream MLS group `rtc_server_id - 1` is a reverse-engineered convention and must pass the real-client gate. It is isolated from normal voice sessions.
-- VP8 negotiation may fail against particular publishers/server offers; H264/AV1 negotiation is not implemented.
-- No RTCP PLI/NACK feedback, sender RTX cache, congestion control, adaptive bitrate or video/audio clock synchronization yet. Periodic keyframes provide only a basic probe recovery path.
+- Viewing supports VP8 and H264; H265, VP9 and AV1 are not advertised. Unsupported server codec changes fail visibly rather than feeding the wrong decoder.
+- Receiver startup, failed decrypt/decode and dropped frame assembly request an RTCP PLI, limited to one per source per second. Publisher PLI requests force a keyframe. NACK recovery, sender RTX cache, congestion control, adaptive bitrate and video/audio clock synchronization remain follow-up work.
 - Probe encoding and stream-audio playback share their own worker. Production encoding needs a separate worker or a measured scheduling budget so decode/encode cannot starve playout.
 - Stream audio is local playback only; it does not yet obey the main voice deaf/volume/device controls. Leave it disabled unless explicitly testing audio. It never captures microphone or loopback audio.
 - This first monitor capture path uses Qt’s platform screenshot API, not Windows Graphics Capture or a GPU encoder. Wayland, protected video, fullscreen games, high-DPI/multi-monitor behavior and macOS permissions need native validation. Window-only selection, cursor overlay, system audio, hardware encoding and RTCP-based adaptation remain follow-up work.
@@ -89,7 +89,25 @@ No third-party source was copied into the project in this checkpoint. Existing d
 ## Screen-sharing checkpoint validation
 
 - An offscreen UI smoke check opens the dialog, checks that Share is disabled without voice, and previews locally without creating a stream. This does not verify native screen capture.
-- Full Qt 6.10.2/RNNoise/FFmpeg build: 9/9 local CTest groups pass. Voice/FFmpeg-off build: 6/6 groups pass.
+- Full Qt 6.10.2/RNNoise/FFmpeg build: 10/10 groups pass, including the new protocol regression group. Voice/FFmpeg-off build: 6/6 groups pass.
 - Added checks for latest-frame replacement, expiration and stop cleanup; 720p low-delay VP8 roundtrips with portrait inputs verify preserved aspect ratio/black margins.
 - Linux build/test results do not establish Windows desktop capture correctness or official Discord compatibility. Native Windows validation requires the CI artifact and two real clients.
 - The previous remote run still failed in AppImage Test and Qt5 Build; their full logs are needed for diagnosis. Modern Windows Qt6 builds passed. No job is disabled by this checkpoint.
+
+## Viewer and frame-rate update
+
+User validation of the previous Windows checkpoint: another Discord client can see the shared monitor, while watching an existing stream remains black after transport connection. This is evidence for publishing on that setup, not proof of all codec/platform combinations.
+
+The receiver previously ignored Voice opcode 12 Video and interpreted opcode 14 Session Update as video SSRC/user metadata. It now receives Video source/layer mappings and handles codec changes independently. Active primary sources receive explicit sink wants; RTX uses the advertised mapping or the native +1 default. Stale sources are retired without restarting assembly on repeated state messages.
+
+H264 depacketization supports single NAL, STAP-A and FU-A with bounded/reordered assembly. Annex B four-byte start codes survive reassembly before DAVE authentication. Joining midstream waits for parameter sets and requests a fresh keyframe. Decoder output is drained and only the latest image is rendered.
+
+Publishing avoids encoding while its bounded packet pacer is busy; skipped capture slots do not introduce unsent reference frames. A one-slot capture queue, 150 ms expiry and an independent voice worker remain. Local preview is refreshed at 10 FPS to limit GUI work. 60 FPS is a target, not a guarantee from the Qt screenshot API or software encoder.
+
+Validation covers opcode 11/12/14 routing, mapping updates, disabled layers and cleanup, H264 STAP/FU loss/wrap/bounds, own three-frame H264 fixture through DAVE/depacketization/FFmpeg, and immediate 720p VP8 encode/decode at 30/60 FPS. An encrypted RTP regression feeds out-of-order VP8 with header extensions and repairs a missing fragment through RTX into VoiceClient, then verifies the decrypted frame. The offscreen UI check confirms all three FPS choices, the 30 FPS default, and local-only preview. Native Discord receive and Windows capture performance still need the updated CI artifact and real clients.
+
+The script `scripts/update-and-run-windows.ps1` downloads the full Windows artifact for a chosen commit and launches a fresh executable path. It requires no checkpoint ZIP and does not apply/push patches.
+
+The updater was exercised with a mocked GitHub CLI: it selects the requested commit and full Windows artifact even when another job fails, and refuses to launch when the full Windows job fails. This check used PowerShell 7 on Linux with only the Windows host guard bypassed; actual Windows PowerShell 5.1 execution remains a native validation step.
+
+Additional implementation references: [RFC 6184](https://www.rfc-editor.org/rfc/rfc6184) (H264 RTP), [RFC 4585](https://www.rfc-editor.org/rfc/rfc4585) (PLI), [Discord DAVE protocol](https://github.com/discord/dave-protocol/blob/main/protocol.md) (codec clear ranges), and the current [discord-native-voice](https://github.com/dolfies/discord-native-voice) receiver/RTCP code. No third-party implementation source was copied; the test fixture was generated locally.
