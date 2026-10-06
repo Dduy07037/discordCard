@@ -335,6 +335,11 @@ if(BUILD_TESTS)
     target_include_directories(TestProto PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME ProtoTests COMMAND TestProto)
 
+    qt_add_executable(TestJsonFields tests/tst_JsonFields.cpp src/Core/Snowflake.cpp)
+    target_link_libraries(TestJsonFields PRIVATE Qt::Core Qt::Gui Qt::Test)
+    target_include_directories(TestJsonFields PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME JsonFieldTests COMMAND TestJsonFields)
+
     qt_add_executable(TestProxy tests/tst_Proxy.cpp src/Core/ProxyConfig.cpp
         src/Core/Logging.cpp src/Core/ImageManager.cpp src/Core/Snowflake.cpp
         src/Discord/Voice/Socks5UdpAssociation.cpp)
@@ -419,7 +424,7 @@ if (MSVC)
     endif()
 
     if(BUILD_TESTS)
-        set(ACHERON_TEST_TARGETS TestMarkdown TestUnicodeEmoji TestFrecency TestProto TestProxy TestActivitySummary)
+        set(ACHERON_TEST_TARGETS TestMarkdown TestUnicodeEmoji TestFrecency TestProto TestProxy TestActivitySummary TestJsonFields)
         if(ENABLE_VOICE)
             list(APPEND ACHERON_TEST_TARGETS TestVoice TestGoLiveSignaling TestVp8Rtp TestVoiceGateway)
         endif()

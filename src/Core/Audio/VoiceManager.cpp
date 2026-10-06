@@ -60,7 +60,7 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
                                 oldState.mute.get() != state.mute.get() ||
                                 oldState.deaf.get() != state.deaf.get() ||
                                 oldState.suppress.get() != state.suppress.get() ||
-                                oldState.selfStream.get() != state.selfStream.get();
+                                oldState.isStreaming() != state.isStreaming();
             if (stateDiffers)
                 emit participantVoiceStateChanged(newChannel, userId);
         }
@@ -110,7 +110,7 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
         bool wasStreaming = selfStream;
         selfMute = state.selfMute.get();
         selfDeaf = state.selfDeaf.get();
-        selfStream = state.selfStream.get();
+        selfStream = state.isStreaming();
 
         qCInfo(LogVoice) << "Voice state: session =" << voiceSessionId
                          << "channel =" << channelId << "guild =" << guildId;

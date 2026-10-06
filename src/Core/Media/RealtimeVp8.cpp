@@ -46,9 +46,12 @@ bool RealtimeVp8::openEncoder(QSize size, int fps, int bitrate)
         impl->error = QStringLiteral("Invalid realtime video encoder settings.");
         return false;
     }
-    if (impl->encoder)
-        return impl->encoder->width == size.width() && impl->encoder->height == size.height()
-            && impl->encoder->framerate.num == fps && impl->encoder->bit_rate == bitrate;
+    if (impl->encoder) {
+        if (impl->encoder->width == size.width() && impl->encoder->height == size.height()
+            && impl->encoder->framerate.num == fps && impl->encoder->bit_rate == bitrate) return true;
+        avcodec_free_context(&impl->encoder);
+        av_frame_unref(impl->input);
+    }
     const auto *codec = avcodec_find_encoder_by_name("libvpx");
     if (!codec) {
         impl->error = QStringLiteral("This FFmpeg build has no libvpx VP8 encoder.");
@@ -65,13 +68,15 @@ bool RealtimeVp8::openEncoder(QSize size, int fps, int bitrate)
     context->bit_rate = bitrate;
     context->rc_max_rate = bitrate;
     context->rc_buffer_size = bitrate;
-    context->gop_size = fps;
+    const bool desktop = size.width() > 640 || size.height() > 360;
+    context->gop_size = fps * (desktop ? 2 : 1);
     context->max_b_frames = 0;
     context->qmin = 4;
     context->qmax = 48;
     context->thread_count = std::max(1, std::min(4, QThread::idealThreadCount() / 2));
     av_opt_set(context->priv_data, "deadline", "realtime", 0);
-    av_opt_set(context->priv_data, "cpu-used", fps > 30 ? "8" : "6", 0);
+    // Keep the diagnostic card's existing setting; use the faster mode for desktop video.
+    av_opt_set(context->priv_data, "cpu-used", desktop ? "8" : "6", 0);
     av_opt_set(context->priv_data, "lag-in-frames", "0", 0);
     if (avcodec_open2(context, codec, nullptr) < 0 || !impl->input || !impl->packet) {
         avcodec_free_context(&context);
@@ -134,18 +139,38 @@ QByteArray RealtimeVp8::encode(const QImage &image, bool keyframe)
 {
     if (!impl->encoder || image.isNull() || av_frame_make_writable(impl->input) < 0)
         return {};
-    // Letterbox non-16:9 monitors instead of stretching their desktop contents.
-    QImage rgb(impl->encoder->width, impl->encoder->height, QImage::Format_RGBA8888);
-    rgb.fill(Qt::black);
-    const auto fitted = image.size().scaled(rgb.size(), Qt::KeepAspectRatio);
-    {
+    QImage rgb;
+    AVPixelFormat sourceFormat = AV_PIX_FMT_RGBA;
+    const bool sameAspect = qint64(image.width()) * impl->encoder->height
+        == qint64(image.height()) * impl->encoder->width;
+    // QScreen normally supplies RGB32/BGRA on Windows. Feed native pixels
+    // directly into swscale instead of painting/copying a full RGBA desktop.
+    if (sameAspect) {
+        rgb = image;
+        if (image.format() == QImage::Format_RGBA8888) sourceFormat = AV_PIX_FMT_RGBA;
+        else if (image.format() == QImage::Format_RGB888) sourceFormat = AV_PIX_FMT_RGB24;
+        else if (image.format() == QImage::Format_RGB32 || image.format() == QImage::Format_ARGB32) {
+#if Q_BYTE_ORDER == Q_LITTLE_ENDIAN
+            sourceFormat = AV_PIX_FMT_BGRA;
+#else
+            sourceFormat = AV_PIX_FMT_ARGB;
+#endif
+        } else rgb = image.convertToFormat(QImage::Format_RGBA8888);
+    } else {
+        // Preserve letterboxing for portrait and other non-16:9 monitors.
+        rgb = QImage(impl->encoder->width, impl->encoder->height, QImage::Format_RGBA8888);
+        rgb.fill(Qt::black);
+        const auto fitted = image.size().scaled(rgb.size(), Qt::KeepAspectRatio);
         QPainter painter(&rgb);
         painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
         painter.drawImage(QRect(QPoint((rgb.width() - fitted.width()) / 2,
                                       (rgb.height() - fitted.height()) / 2), fitted), image);
     }
-    impl->encodeScale = sws_getCachedContext(impl->encodeScale, rgb.width(), rgb.height(), AV_PIX_FMT_RGBA,
-        impl->encoder->width, impl->encoder->height, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    if (rgb.isNull()) return {};
+    const bool resizing = rgb.width() != impl->encoder->width || rgb.height() != impl->encoder->height;
+    impl->encodeScale = sws_getCachedContext(impl->encodeScale, rgb.width(), rgb.height(), sourceFormat,
+        impl->encoder->width, impl->encoder->height, AV_PIX_FMT_YUV420P,
+        resizing ? SWS_BILINEAR : SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
     if (!impl->encodeScale)
         return {};
     const uint8_t *source[] = {rgb.constBits()};

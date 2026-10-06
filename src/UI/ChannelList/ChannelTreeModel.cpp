@@ -240,7 +240,7 @@ QVariant ChannelTreeModel::data(const QModelIndex &index, int role) const
         if (!state.has_value())
             return false;
         if (role == IsStreamingRole)
-            return state->selfStream.get();
+            return state->isStreaming();
         if (role == IsVoiceMutedRole)
             return state->selfMute.get() || state->mute.get();
         return state->selfDeaf.get() || state->deaf.get();

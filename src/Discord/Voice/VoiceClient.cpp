@@ -482,6 +482,15 @@ void VoiceClient::advertiseVideo()
         {"rtx_ssrc", qint64(localRtxSsrc)}, {"streams", QJsonArray{stream}}});
 }
 
+void VoiceClient::updateVideoSettings(QSize resolution, int fps, int bitrate)
+{
+    if (!videoSession || !videoPublisher || !videoFragments.isEmpty()) return;
+    videoResolution = resolution;
+    videoFps = qBound(15, fps, 60);
+    videoBitrate = qBound(100000, bitrate, 20000000);
+    advertiseVideo();
+}
+
 void VoiceClient::requestVideoKeyframe(quint32 ssrc)
 {
     if (!videoSession || videoPublisher || !remoteVideoSsrcs.contains(ssrc) ||
@@ -548,6 +557,7 @@ bool VoiceClient::sendVideoFrame(const QByteArray &frame, uint32_t timestamp)
                 videoFragments.clear();
                 videoPacer->stop();
                 emit videoKeyframeRequested();
+                emit videoFrameFinished(false);
                 return;
             }
             // Bounded pacing, never queue another encoded frame behind this one.
@@ -570,6 +580,7 @@ bool VoiceClient::sendVideoFrame(const QByteArray &frame, uint32_t timestamp)
                 videoFragments.clear();
                 videoPacer->stop();
                 ++videoSentFrames;
+                emit videoFrameFinished(true);
             }
         });
     }

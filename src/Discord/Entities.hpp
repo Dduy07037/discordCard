@@ -377,6 +377,11 @@ struct VoiceState : Core::JsonUtils::JsonObject
     Field<bool> suppress;
     Field<QString, true> requestToSpeakTimestamp;
 
+    [[nodiscard]] bool isStreaming() const
+    {
+        return selfStream.hasValue() && selfStream.get();
+    }
+
     static VoiceState fromJson(const QJsonObject &obj)
     {
         VoiceState state;

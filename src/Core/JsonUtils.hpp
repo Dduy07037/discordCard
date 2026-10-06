@@ -173,7 +173,8 @@ protected:
             Value,
         };
         State state;
-        T value;
+        // Optional/nullable scalar fields must also be safe to copy when absent.
+        T value{};
     };
 
     template <typename T>

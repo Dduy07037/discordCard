@@ -7,6 +7,7 @@
 #include <QPainter>
 #include "Core/Media/LatestVideoFrame.hpp"
 #include "Core/Media/ScreenShareSettings.hpp"
+#include "Core/Media/StreamLoadController.hpp"
 #ifdef TEST_VP8_CODEC
 #include "Core/Media/RealtimeVp8.hpp"
 #endif
@@ -25,15 +26,45 @@ private slots:
     void conflictingBoundaries();
     void newestScreenFrameAndExpiry();
     void h264StapFuLossAndBounds();
+    void automaticLoadControl();
 #ifdef TEST_VP8_CODEC
     void realtimeCodecRoundtrip();
     void desktopCodecKeepsAspectRatio();
     void higherFrameRates_data();
     void higherFrameRates();
     void highQualityDesktopKeepsFineDetail();
+    void movingDesktopAndEncoderReconfiguration();
     void h264DecodeAndDavePacketization();
 #endif
 };
+
+void TestVp8Rtp::automaticLoadControl()
+{
+    using namespace Acheron::Core::Media;
+    StreamLoadController automatic(ScreenShareSettings::forPreset(3, 60), 60);
+    for (int i = 0; i < 20; ++i) QVERIFY(!automatic.observe(200, 250, true, 10000 + i, true));
+    QCOMPARE(automatic.fps, 60); // keyframe bursts alone do not reduce FPS
+    for (int i = 0; i < 6; ++i) automatic.observe(30, 40, true, 11000 + i, false);
+    QCOMPARE(automatic.fps, 30);
+    for (int i = 0; i < 20; ++i) QVERIFY(!automatic.observe(40, 55, true, 12000 + i, false));
+    QCOMPARE(automatic.fps, 30); // cooldown prevents oscillation/repeated resets
+    automatic.observe(40, 55, true, 16000, false);
+    QCOMPARE(automatic.fps, 20);
+    for (int i = 0; i < 6; ++i) automatic.observe(80, 100, true, 21000 + i, false);
+    QCOMPARE(automatic.fps, 15);
+    for (int i = 0; i < 6; ++i) automatic.observe(80, 100, true, 26000 + i, false);
+    QCOMPARE(automatic.settings.resolution, QSize(1280, 720));
+    for (int i = 0; i < 100; ++i) automatic.observe(500, 500, false, 31000 + i * 100, false);
+    QCOMPARE(automatic.fps, 15);
+    QVERIFY(automatic.settings.bitrate >= 2000000);
+    StreamLoadController healthy(ScreenShareSettings::forPreset(3, 30), 30);
+    for (int i = 0; i < 200; ++i) QVERIFY(!healthy.observe(10, 20, true, 10000 + i * 33, false));
+    QCOMPARE(healthy.settings.resolution, QSize(1920, 1080));
+    StreamLoadController manual(ScreenShareSettings::forPreset(2, 60), 60);
+    for (int i = 0; i < 100; ++i) QVERIFY(!manual.observe(500, 500, false, 10000 + i * 100, false));
+    QCOMPARE(manual.fps, 60);
+    QCOMPARE(manual.settings.bitrate, 16000000);
+}
 
 void TestVp8Rtp::newestScreenFrameAndExpiry()
 {
@@ -244,7 +275,7 @@ void TestVp8Rtp::realtimeCodecRoundtrip()
         const auto pixel = decoded.pixelColor(320, 180);
         QVERIFY(std::abs(pixel.red() - 30) < 8);
         QVERIFY(std::abs(pixel.green() - 100) < 8);
-        QVERIFY(std::abs(pixel.blue() - 180) < 8);
+        QVERIFY2(std::abs(pixel.blue() - 180) < 8, qPrintable(QStringLiteral("frame %1: blue=%2").arg(i).arg(pixel.blue())));
     }
     QVERIFY(decoder.decode(QByteArray("invalid")).isNull());
 }
@@ -323,6 +354,38 @@ void TestVp8Rtp::highQualityDesktopKeepsFineDetail()
     const auto decoded = decoder.decode(encoded);
     QCOMPARE(decoded.size(), desktop.size());
     QVERIFY(decoded.pixelColor(101, 250).red() - decoded.pixelColor(100, 250).red() > 160);
+}
+
+void TestVp8Rtp::movingDesktopAndEncoderReconfiguration()
+{
+    Acheron::Core::Media::RealtimeVp8 encoder, decoder;
+    QVERIFY(encoder.openEncoder(QSize(1920, 1080), 30, 6000000));
+    QVERIFY(decoder.openDecoder());
+    double totalEncodeMs = 0;
+    for (int i = 0; i < 16; ++i) {
+        const auto target = i < 8 ? QSize(1920, 1080) : QSize(1280, 720);
+        if (i == 8) QVERIFY(encoder.openEncoder(target, 20, 4000000));
+        QImage image(1920, 1080, i % 2 ? QImage::Format_RGBA8888 : QImage::Format_RGB32);
+        image.fill(QColor(210, 210, 210));
+        {
+            QPainter p(&image);
+            for (int x = 100; x < 700; x += 4) p.fillRect(x, 100, 1, 500, Qt::black);
+            p.fillRect(i * 40, 700, 300, 120, Qt::cyan);
+        }
+        QElapsedTimer timer; timer.start();
+        const auto encoded = encoder.encode(image, i == 0 || i == 8);
+        totalEncodeMs += double(timer.nsecsElapsed()) / 1000000;
+        QVERIFY(!encoded.isEmpty());
+        const auto decoded = decoder.decode(encoded);
+        QCOMPARE(decoded.size(), target);
+        const auto background = decoded.pixelColor(target.width() - 20, target.height() - 20);
+        QVERIFY(std::abs(background.red() - 210) < 15);
+        QVERIFY(std::abs(background.blue() - 210) < 15);
+        const auto cyan = decoded.pixelColor((i * 40 + 150) * target.width() / 1920,
+                                             760 * target.height() / 1080);
+        QVERIFY(cyan.red() < 30 && cyan.green() > 220 && cyan.blue() > 220);
+    }
+    qInfo() << "Moving desktop/native RGB32+RGBA and 1080p->720p reconfiguration:" << totalEncodeMs / 16 << "ms mean encode";
 }
 
 void TestVp8Rtp::h264DecodeAndDavePacketization()

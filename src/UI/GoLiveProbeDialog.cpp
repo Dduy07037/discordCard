@@ -6,6 +6,7 @@
 #include "Core/Audio/OpusEncoder.hpp"
 #include "Core/Media/RealtimeVp8.hpp"
 #include "Core/Media/LatestVideoFrame.hpp"
+#include "Core/Media/StreamLoadController.hpp"
 #include "Discord/Voice/VoiceClient.hpp"
 
 #include <QCheckBox>
@@ -42,7 +43,7 @@ public:
                      std::shared_ptr<Core::Media::LatestVideoFrame> captureFrames = {}, int fps = 30,
                      Core::Media::ScreenShareSettings settings = {})
         : connection(connection), accountId(accountId), proxy(proxy), mailbox(std::move(mailbox)),
-          captureFrames(std::move(captureFrames)), fps(fps), settings(settings) {}
+          captureFrames(std::move(captureFrames)), fps(fps), settings(settings), load(settings, fps) {}
     void start()
     {
         const bool publisher = connection.value("publisher").toBool();
@@ -65,6 +66,20 @@ public:
             if (!publisher && !codec.openDecoder(name)) emit statusChanged(codec.error());
         });
         connect(client, &Discord::Voice::VoiceClient::videoKeyframeRequested, this, [this] { needKeyframe = true; });
+        connect(client, &Discord::Voice::VoiceClient::videoFrameFinished, this, [this](bool delivered) {
+            const auto now = Core::Media::videoClockMs();
+            if (captureFrames && load.observe(lastEncodeMs, double(now - frameStartedAtMs), delivered, now, lastFrameWasKeyframe)) {
+                fps = load.fps;
+                settings = load.settings;
+                if (!codec.openEncoder(settings.resolution, fps, settings.bitrate)) {
+                    failure = codec.error(); emit statusChanged(failure); return;
+                }
+                needKeyframe = true;
+                client->updateVideoSettings(settings.resolution, fps, settings.bitrate);
+                emit captureRateChanged(fps, settings.resolution, settings.bitrate);
+            }
+            scheduleFrame();
+        });
         connect(client, &Discord::Voice::VoiceClient::connected, this, [this, publisher] {
             if (frameTimer) { delete frameTimer; frameTimer = nullptr; }
             if (audioTimer) { delete audioTimer; audioTimer = nullptr; }
@@ -73,13 +88,17 @@ public:
             needKeyframe = true;
             client->advertiseVideo();
             clock.start();
+            sessionStartedAtMs = Core::Media::videoClockMs();
+            nextFrameAtMs = sessionStartedAtMs;
+            lastKeyframeAtMs = 0;
             emit statusChanged(tr("Stream transport connected. Waiting for DAVE/media…"));
             if (publisher) {
                 frameTimer = new QTimer(this);
                 frameTimer->setTimerType(Qt::PreciseTimer);
-                frameTimer->setInterval(captureFrames ? qRound(1000.0 / fps) : 67);
+                frameTimer->setSingleShot(true);
                 connect(frameTimer, &QTimer::timeout, this, &ProbeMediaWorker::sendFrame);
-                frameTimer->start();
+                if (captureFrames) emit captureRateChanged(fps, settings.resolution, settings.bitrate);
+                scheduleFrame();
                 toneEncoder.init(48000, 2, OPUS_APPLICATION_AUDIO);
                 toneEncoder.setDtx(false);
                 audioTimer = new QTimer(this);
@@ -127,12 +146,16 @@ public:
             const auto rate = elapsed > 0 && total >= lastStatsFrames
                 ? double(total - lastStatsFrames) * 1000 / elapsed : 0.0;
             lastStatsFrames = total;
-            emit statisticsChanged(tr("%1 • DAVE %2 • %3 FPS • sources %4 • packets %5 • frames %6 • transport errors %7 • DAVE errors %8 • unmapped %9")
+            QString text = tr("%1 • DAVE %2 • %3 FPS • sources %4 • packets %5 • frames %6 • transport errors %7 • DAVE errors %8 • unmapped %9")
                 .arg(stats.value("codec").toString().isEmpty() ? tr("negotiating") : stats.value("codec").toString())
                 .arg(stats.value("dave_ready").toBool() ? tr("ready") : tr("waiting"))
                 .arg(rate, 0, 'f', 1).arg(stats.value("sources").toInt()).arg(stats.value("packets").toDouble(), 0, 'f', 0)
                 .arg(total).arg(stats.value("transport_errors").toDouble(), 0, 'f', 0)
-                .arg(stats.value("dave_errors").toDouble(), 0, 'f', 0).arg(stats.value("unknown_sources").toDouble(), 0, 'f', 0));
+                .arg(stats.value("dave_errors").toDouble(), 0, 'f', 0).arg(stats.value("unknown_sources").toDouble(), 0, 'f', 0);
+            if (publisher && captureFrames) text += tr(" • %1×%2 / target %3 FPS / %4 Mbps • encode %5 ms%6")
+                .arg(settings.resolution.width()).arg(settings.resolution.height()).arg(fps).arg(settings.bitrate / 1000000.0, 0, 'f', 1)
+                .arg(lastEncodeMs, 0, 'f', 1).arg(settings.automatic ? tr(" / Auto") : QString());
+            emit statisticsChanged(text);
         });
         statsTimer->start();
         client->start();
@@ -154,16 +177,41 @@ public:
 signals:
     void statusChanged(const QString &text);
     void statisticsChanged(const QString &text);
+    void captureRateChanged(int fps, QSize resolution, int bitrate);
 private:
+    void scheduleFrame()
+    {
+        if (!frameTimer) return;
+        frameTimer->start(int(qBound(qint64(1), nextFrameAtMs - Core::Media::videoClockMs(), qint64(1000))));
+    }
     void sendFrame()
     {
-        if (!client->canSendVideoFrame())
+        if (!client->canSendVideoFrame()) {
+            frameTimer->start(20);
             return;
+        }
+        frameStartedAtMs = Core::Media::videoClockMs();
+        nextFrameAtMs = frameStartedAtMs + qRound(1000.0 / (captureFrames ? fps : 15));
         if (captureFrames) {
             const auto frame = captureFrames->take(Core::Media::videoClockMs());
-            if (!frame) return;
-            const auto encoded = codec.encode(frame->image, needKeyframe || frames++ % fps == 0);
-            needKeyframe = !client->sendVideoFrame(encoded, uint32_t(clock.elapsed() * 90));
+            if (!frame) { frameTimer->start(5); return; }
+            lastFrameWasKeyframe = needKeyframe || frameStartedAtMs - lastKeyframeAtMs >= 2000;
+            QElapsedTimer encoding; encoding.start();
+            const auto encoded = codec.encode(frame->image, lastFrameWasKeyframe);
+            lastEncodeMs = double(encoding.nsecsElapsed()) / 1000000;
+            // Capture timestamps exclude variable encoder/pacer scheduling delay.
+            const auto timestamp = uint32_t(qMax<qint64>(0, frame->capturedAtMs - sessionStartedAtMs) * 90);
+            needKeyframe = !client->sendVideoFrame(encoded, timestamp);
+            if (!needKeyframe && lastFrameWasKeyframe) lastKeyframeAtMs = frameStartedAtMs;
+            if (needKeyframe) {
+                if (load.observe(lastEncodeMs, lastEncodeMs, false, Core::Media::videoClockMs(), lastFrameWasKeyframe)) {
+                    fps = load.fps; settings = load.settings;
+                    if (!codec.openEncoder(settings.resolution, fps, settings.bitrate)) { failure = codec.error(); emit statusChanged(failure); return; }
+                    client->updateVideoSettings(settings.resolution, fps, settings.bitrate);
+                    emit captureRateChanged(fps, settings.resolution, settings.bitrate);
+                }
+                scheduleFrame();
+            }
             return;
         }
         QImage image(640, 360, QImage::Format_RGBA8888);
@@ -178,8 +226,9 @@ private:
         painter.drawText(QRect(20, 285, 600, 60), Qt::AlignCenter,
             tr("Go Live probe • %1 ms").arg(clock.elapsed()));
         painter.end();
-        const auto encoded = codec.encode(image, needKeyframe || frames++ % 15 == 0);
+        const auto encoded = codec.encode(image, needKeyframe || frames++ % 30 == 0);
         needKeyframe = !client->sendVideoFrame(encoded, uint32_t(clock.elapsed() * 90));
+        if (needKeyframe) scheduleFrame();
     }
     void sendTone()
     {
@@ -221,6 +270,10 @@ private:
     quint64 decodedFrames = 0, lastStatsFrames = 0;
     int fps = 30;
     Core::Media::ScreenShareSettings settings;
+    Core::Media::StreamLoadController load;
+    qint64 sessionStartedAtMs = 0, frameStartedAtMs = 0, nextFrameAtMs = 0, lastKeyframeAtMs = 0;
+    double lastEncodeMs = 0;
+    bool lastFrameWasKeyframe = true;
     QString failure;
     unsigned frames = 0;
     quint64 toneSample = 0;
@@ -266,8 +319,9 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
     quality->setAccessibleName(tr("Screen sharing quality"));
     quality->addItem(tr("720p Balanced"), 0);
     quality->addItem(tr("1080p High"), 1);
-    quality->addItem(tr("1080p Maximum (default)"), 2);
-    quality->setCurrentIndex(2);
+    quality->addItem(tr("1080p Maximum"), 2);
+    quality->addItem(tr("Auto — smooth streaming (default)"), 3);
+    quality->setCurrentIndex(3);
     qualityRow->addWidget(quality);
     qualityRow->addStretch();
     layout->addLayout(qualityRow);
@@ -276,8 +330,10 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
     layout->addWidget(qualityHint);
     const auto updateQualityHint = [this] {
         const auto choice = Core::Media::ScreenShareSettings::forPreset(quality->currentData().toInt(), frameRate->currentData().toInt());
-        qualityHint->setText(tr("%1 × %2 • target %3 Mbps. Higher quality needs more upload bandwidth and CPU. Stop sharing before changing.")
-            .arg(choice.resolution.width()).arg(choice.resolution.height()).arg(choice.bitrate / 1000000));
+        qualityHint->setText(tr("%1 × %2 • target %3 Mbps. %4 Stop sharing before changing.")
+            .arg(choice.resolution.width()).arg(choice.resolution.height()).arg(choice.bitrate / 1000000)
+            .arg(choice.automatic ? tr("Auto lowers FPS/resolution when encoding or sending falls behind.")
+                                 : tr("Fixed quality needs sufficient upload bandwidth and CPU.")));
     };
     connect(quality, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateQualityHint);
     connect(frameRate, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateQualityHint);
@@ -420,7 +476,7 @@ GoLiveProbeDialog::GoLiveProbeDialog(Core::Audio::VoiceManager *voiceManager, Co
         if (!manager) return;
         for (const auto &participant : manager->currentParticipants()) {
             const auto state = manager->voiceStateForUser(participant.userId);
-            if (participant.userId == accountId || !state || !state->selfStream.get()) continue;
+            if (participant.userId == accountId || !state || !state->isStreaming()) continue;
             const Core::Audio::StreamKey key{manager->currentGuildId(), manager->currentChannelId(), participant.userId};
             const auto name = nameResolver ? nameResolver(participant.userId) : QString::number(participant.userId);
             streams->addItem(tr("%1 • TRỰC TIẾP").arg(name), key.toString());
@@ -588,6 +644,12 @@ void GoLiveProbeDialog::openSession(const QString &key, const QJsonObject &conne
     connect(session.worker, &ProbeMediaWorker::statisticsChanged, this, [this, key](const QString &text) {
         if (key == requestedPublisher) publisherStats->setText(text);
         else if (key == requestedViewer) viewerStats->setText(text);
+    });
+    connect(session.worker, &ProbeMediaWorker::captureRateChanged, this, [this, key](int fps, QSize resolution, int bitrate) {
+        if (key != requestedPublisher || !capturedScreen || !captureTimer->isActive()) return;
+        captureTimer->setInterval(qRound(1000.0 / fps));
+        sharingStatus->setText(tr("Capturing %1 • %2 × %3 / target %4 FPS / %5 Mbps")
+            .arg(capturedScreen->name()).arg(resolution.width()).arg(resolution.height()).arg(fps).arg(bitrate / 1000000.0, 0, 'f', 1));
     });
     session.thread->start();
 }

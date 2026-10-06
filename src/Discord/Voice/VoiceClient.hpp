@@ -74,6 +74,7 @@ public:
     bool sendVideoFrame(const QByteArray &vp8Frame, uint32_t timestamp);
     bool canSendVideoFrame() const;
     void advertiseVideo();
+    void updateVideoSettings(QSize resolution, int fps, int bitrate);
     void requestVideoKeyframe(quint32 ssrc);
     QJsonObject videoDiagnostics() const;
 
@@ -95,6 +96,7 @@ signals:
     void videoError(const QString &reason);
     void videoCodecChanged(const QString &codec);
     void videoKeyframeRequested();
+    void videoFrameFinished(bool delivered);
     void privacyCodeChanged(const QString &code);
     void sendDiagnosticsUpdated(const QJsonObject &stats);
 

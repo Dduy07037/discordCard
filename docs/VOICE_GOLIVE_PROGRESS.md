@@ -23,7 +23,7 @@ Implemented:
 - Session ownership/context validation, either arrival order of CREATE/SERVER_UPDATE, duplicate suppression, timeout, token replacement and cleanup on leaving voice.
 - Separate native UDP RTC session using the existing transport encryption and libdave implementation. Normal voice continues in its own workers.
 - Explicit monitor selection, one-shot local preview, and real desktop capture through Qt QScreen on supported desktops. Capture starts only on Share, stops on Stop/close/leave/monitor removal, and is never resumed automatically after the stream is deleted. A single replaceable frame connects GUI capture to the separate encoding worker; images older than 150 ms are discarded.
-- VP8 publishing and VP8/H264 receive negotiation: monitor video is letterboxed to the selected 720p or 1080p resolution, with 15/30/60 FPS targets (30 default) and 4–16 Mbps profiles (1080p Maximum / 12 Mbps at 30 FPS default). Capture and encode timers use the selected rate; actual completed-frame FPS is displayed. The optional diagnostic test card stays at 640×360 / 15 fps / 600 kbps. There is no system-audio or microphone capture in the stream publisher; the main voice call remains separate.
+- VP8 publishing and VP8/H264 receive negotiation: monitor video is letterboxed to the selected 720p or 1080p resolution, with 15/30/60 FPS targets (30 default) and manual 4–16 Mbps profiles and Auto (default: 1080p / 30 FPS / 6 Mbps). Auto can lower FPS, bitrate and resolution when the local encoder/sender falls behind; actual completed-frame FPS, current target and encode time are displayed. The optional diagnostic test card stays at 640×360 / 15 fps / 600 kbps. There is no system-audio or microphone capture in the stream publisher; the main voice call remains separate.
 - Watchers are listed by display name when available; watching and sharing have separate Stop controls. A receive worker decodes VP8/H264 and optionally plays stream audio. Original decoded images support zoom, drag-to-pan, fitting to a resizable window and fullscreen. A red TRỰC TIẾP badge in voice participant rows follows the server's sharing flag.
 - DAVE encryption of a complete VP8 frame **before** RTP fragmentation; full reassembly **before** DAVE decryption. No plaintext outbound video during MLS setup.
 - Packet pacing with one bounded pending frame; bounded reassembly, deadline expiry, sequence/timestamp wrap handling, extension parsing, RTX mapping from session metadata, duplicate/late-frame suppression and latest-image rendering.
@@ -113,7 +113,7 @@ The updater was exercised with a mocked GitHub CLI: it selects the requested com
 Additional implementation references: [RFC 6184](https://www.rfc-editor.org/rfc/rfc6184) (H264 RTP), [RFC 4585](https://www.rfc-editor.org/rfc/rfc4585) (PLI), [Discord DAVE protocol](https://github.com/discord/dave-protocol/blob/main/protocol.md) (codec clear ranges), and the current [discord-native-voice](https://github.com/dolfies/discord-native-voice) receiver/RTCP code. No third-party implementation source was copied; the test fixture was generated locally.
 
 
-## Zoom, quality profiles and live badges
+## Previous checkpoint: zoom, quality profiles and live badges
 
 The user reported that watching streams works after the receive/FPS update. This update addresses viewer sizing, publishing quality and identifying live participants.
 
@@ -136,3 +136,22 @@ Voice participant rows paint a red TRỰC TIẾP badge beside users whose server
 Validation: full application build and 10/10 test groups, minimal build and 6/6 groups. Added 1080p maximum-profile roundtrips at 30/60 FPS, native one-pixel contrast retention, and 300 KiB DAVE/RTP frame roundtrips. An offscreen harness checks quality/FPS defaults, original frame resolution, zoom persistence across resize/new frames, wheel zoom/bounds, fullscreen open/update/clear/close/reopen, local/remote live start/stop notifications, badge rendering alongside muted/deafened icons and sharing disabled without voice. These checks do not measure native Windows capture or a live high-bitrate Discord stream.
 
 References for this update: [FFmpeg libvpx options](https://ffmpeg.org/ffmpeg-codecs.html#libvpx) and Qt QWidget/QPainter event/rendering APIs. No third-party implementation code was copied.
+
+
+## Live status and streaming load correction
+
+The user reported false TRỰC TIẾP badges and stutter after the high-quality update. `self_stream` is optional: the previous badge code read its scalar value even when absent. Optional/nullable field storage is now value-initialized, and every live-state consumer requires `hasValue() && value`. Missing, null or false flags hide the badge; transitions back from true update both local and remote participant rows and the stream picker.
+
+Auto is the new default at 30 FPS. It starts at 1920×1080 / 6 Mbps (8 Mbps if the user selects 60 FPS). Balanced, High and Maximum remain available manually at their previous bitrate/resolution targets. Manual profiles do not adapt.
+
+The local load controller measures encode time and the encode-plus-pacing cycle. After six consecutive overloaded samples, with four seconds between adjustments, Auto steps from 60 to 30 to 20 to 15 FPS, then from 1080p to 720p if still overloaded. Bitrate decreases proportionally, bounded below by 2 Mbps. Delivered periodic keyframe bursts alone do not trigger adaptation. It only steps down until the stream is restarted, preventing repeated quality oscillation. Encoder, capture timer and gateway metadata change together without replacing the RTC/DAVE session.
+
+For matching aspect ratios, native RGB32/BGRA or RGBA pixels go directly through swscale into YUV, removing the full-resolution QPainter copy; swscale resizes if necessary. Other aspect ratios retain smooth letterboxing. Desktop VP8 uses the fastest realtime CPU setting. Periodic desktop keyframes are spaced two seconds apart; recovery requests still trigger an immediate keyframe. RTP timestamps use capture time rather than encoding completion time.
+
+The encode timer now schedules the next frame after local packet pacing finishes, using the remaining frame budget. It no longer waits another entire frame interval when a repeating timer fires while the previous frame is pending. Readiness retries, a single capture slot, one pending encoded frame and 150 ms stale-frame expiry remain bounded.
+
+This is CPU/local sender adaptation, not remote bandwidth estimation: successful local UDP submission does not establish remote delivery. There is no new hardware encoder or feedback-driven network congestion controller. CPU, Qt monitor capture, available uplink and the viewer's device can still limit performance. Prefer Auto / 30 FPS for native validation before manually selecting Maximum.
+
+Validation includes missing/null/false/true JSON and poisoned-memory scalar initialization, local/remote true-to-missing UI transitions, controller overload/cooldown/keyframe/manual cases, alternating native RGB32/RGBA moving desktop frames and live 1080p-to-720p encoder/decoder reconfiguration. The test environment has no signed-in Discord session; actual Windows capture and end-to-end streaming require the new CI artifact and real clients.
+
+Local verification for this correction: full Qt 6.10.2/RNNoise/FFmpeg application build and 11/11 CTest groups pass; voice/FFmpeg-off build and 7/7 groups pass. The offscreen UI harness passes Auto/30 FPS defaults, local/remote live-to-missing transitions, badge visibility, original-frame zoom/pan/fullscreen lifecycle and sharing guard. Windows updater PowerShell syntax parses successfully. These are local checks, not native end-to-end latency/FPS measurements.
