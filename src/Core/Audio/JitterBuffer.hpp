@@ -16,6 +16,8 @@ public:
 
     /// Add a frame to the buffer.
     void push(uint16_t sequence, const QByteArray &data);
+    void push(uint16_t sequence, uint32_t timestamp, const QByteArray &data);
+    [[nodiscard]] int bufferedPacketCount() const { return frames.size(); }
 
     /// Get the next frame in sequence order.
     /// Returns empty QByteArray if the frame is missing (packet loss).
@@ -54,6 +56,9 @@ private:
     bool prebuffering = true;
     int consecutiveMisses = 0;
     int consecutiveHits = 0;
+    bool hasTimestamp = false;
+    uint16_t lastReceivedSequence = 0;
+    uint32_t lastReceivedTimestamp = 0;
 
 };
 

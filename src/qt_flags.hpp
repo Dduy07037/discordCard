@@ -4,7 +4,7 @@
 
 #include <QFlags>
 
-#if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
 
 #define ACHERON_DECLARE_FLAGS(FlagsName, EnumName) \
     Q_DECLARE_FLAGS(FlagsName, EnumName)           \

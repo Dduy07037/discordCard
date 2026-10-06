@@ -2,9 +2,10 @@ name: Build
 
 on:
   push:
-    branches: [master, ci/**]
+    branches: [main, master, ci/**, feat/voice-golive]
   pull_request:
-    branches: [master]
+    branches: [main, master]
+  workflow_dispatch:
 
 env:
   CURL_IMPERSONATE_VERSION: v2.0.0

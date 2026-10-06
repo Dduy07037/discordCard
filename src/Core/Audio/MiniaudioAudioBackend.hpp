@@ -1,6 +1,9 @@
 #pragma once
 
 #include "IAudioBackend.hpp"
+#include "CaptureQueue.hpp"
+
+class QTimer;
 
 #include <atomic>
 #include <memory>
@@ -42,6 +45,7 @@ public:
 
     [[nodiscard]] int queuedPlaybackFrames() const override;
     unsigned int takePlaybackUnderruns() override;
+    quint64 captureDroppedFrames() const override;
     bool pushPlaybackFrame(const int16_t *frame) override;
 
 private:
@@ -55,7 +59,10 @@ private:
 private:
     std::unique_ptr<MiniaudioState> ma;
 
-    QByteArray captureBuffer;
+    CaptureQueue captureQueue;
+    QTimer *captureDrainTimer = nullptr;
+    quint64 staleCaptureFrames = 0;
+    void drainCapture();
 
     QByteArray selectedInputId;
     QByteArray selectedOutputId;

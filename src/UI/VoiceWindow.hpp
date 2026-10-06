@@ -168,6 +168,7 @@ private:
     QVBoxLayout *userListLayout;
     QHash<Core::Snowflake, VoiceUserWidget *> userWidgets;
     QPushButton *privacyCodeBtn;
+    QLabel *diagnosticsLabel = nullptr;
 
     VolumeMeter *volumeMeter;
     QComboBox *inputDeviceCombo;

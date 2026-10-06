@@ -14,6 +14,7 @@ namespace Audio {
 VoiceManager::VoiceManager(Snowflake accountId, const ProxyConfig &proxy, QObject *parent)
     : QObject(parent), accountId(accountId), proxy(proxy), audioBackend(IAudioBackend::create())
 {
+    streamSignaling = new GoLiveSignaling(accountId, this);
     connect(audioBackend.get(), &IAudioBackend::devicesChanged, this, &VoiceManager::onDevicesChanged);
 }
 
@@ -88,6 +89,7 @@ void VoiceManager::handleVoiceStateUpdate(const Discord::VoiceState &state)
         voiceSessionId = state.sessionId.get();
         channelId = newChannelId;
         guildId = state.guildId.hasValue() ? state.guildId.get() : Snowflake::Invalid;
+        streamSignaling->setVoiceContext(guildId, channelId, voiceSessionId, isConnected() && !channelChanged);
 
         if (channelChanged) {
             if (!participants.isEmpty()) {
@@ -467,6 +469,9 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
     Snowflake serverId = guildId.isValid() ? guildId : channelId;
     voiceClient = new Discord::Voice::VoiceClient(endpoint, token, serverId, channelId, accountId, voiceSessionId, proxy);
     audioPipeline = new AudioPipeline;
+    const auto sendQueue = std::make_shared<AudioSendQueue>();
+    audioPipeline->setSendQueue(sendQueue);
+    voiceClient->setSendQueue(sendQueue);
 
     QList<Snowflake> channelUsers;
     for (auto it = knownVoiceStates.constBegin(); it != knownVoiceStates.constEnd(); ++it) {
@@ -485,7 +490,7 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
 
     connect(voiceClient, &Discord::Voice::VoiceClient::audioReceived, audioPipeline, &AudioPipeline::onAudioReceived);
 
-    connect(audioPipeline, &AudioPipeline::encodedAudioReady, voiceClient, &Discord::Voice::VoiceClient::sendAudio);
+    connect(audioPipeline, &AudioPipeline::audioPacketsAvailable, voiceClient, &Discord::Voice::VoiceClient::drainAudio);
 
     connect(audioPipeline, &AudioPipeline::speakingChanged, voiceClient, &Discord::Voice::VoiceClient::setSpeaking);
 
@@ -544,6 +549,16 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
                     emit participantSpeakingChanged(userId, it->speaking);
             });
 
+    auto updateDiagnostics = [this, gen](const QJsonObject &stats) {
+        if (gen != voiceGeneration)
+            return;
+        for (auto it = stats.constBegin(); it != stats.constEnd(); ++it)
+            cachedDiagnostics.insert(it.key(), it.value());
+        emit diagnosticsUpdated(cachedDiagnostics);
+    };
+    connect(audioPipeline, &AudioPipeline::diagnosticsUpdated, this, updateDiagnostics);
+    connect(voiceClient, &Discord::Voice::VoiceClient::sendDiagnosticsUpdated, this, updateDiagnostics);
+
     connect(audioPipeline, &AudioPipeline::userAudioLevelChanged, this, &VoiceManager::userAudioLevelChanged);
 
     connect(voiceClient, &Discord::Voice::VoiceClient::connected,
@@ -584,6 +599,7 @@ void VoiceManager::connectToVoiceServer(const QString &endpoint, const QString &
 
 void VoiceManager::stopVoiceThread()
 {
+    streamSignaling->setVoiceContext(guildId, channelId, voiceSessionId, false);
     if (!voiceThread && !audioThread)
         return;
 
@@ -592,6 +608,7 @@ void VoiceManager::stopVoiceThread()
     participants.clear();
     mutedUsers.clear();
     cachedPrivacyCode.clear();
+    cachedDiagnostics = {};
     if (hadParticipants)
         emit participantsCleared();
 
@@ -676,6 +693,7 @@ void VoiceManager::populateParticipantsFromCache()
 
 void VoiceManager::onVoiceClientConnected()
 {
+    streamSignaling->setVoiceContext(guildId, channelId, voiceSessionId, true);
     if (!audioPipeline)
         return;
 

@@ -45,7 +45,7 @@ void AudioPipeline::start(IAudioBackend *backend, bool capturing)
         return;
 
     audioBackend = backend;
-    connect(audioBackend, &IAudioBackend::audioCaptured, this, &AudioPipeline::onAudioCaptured, Qt::QueuedConnection);
+    connect(audioBackend, &IAudioBackend::audioCaptured, this, &AudioPipeline::onAudioCaptured, Qt::DirectConnection);
 
     initializeEncoder();
 
@@ -57,6 +57,12 @@ void AudioPipeline::start(IAudioBackend *backend, bool capturing)
     userRmsThrottleTimer.start();
     playbackTargetFrameCount = MIN_PLAYBACK_TARGET_FRAMES;
     stablePlaybackTicks = 0;
+    captureAgeCount = 0;
+    staleBeforeEncode = 0;
+    measuredUnderruns = 0;
+    lastDiagnosticsMs = monotonicMilliseconds();
+    lastMixMs = 0;
+    maxMixLatenessMs = 0;
 
     if (capturing)
         audioBackend->startCapture();
@@ -77,6 +83,8 @@ void AudioPipeline::start(IAudioBackend *backend, bool capturing)
 
 void AudioPipeline::stop()
 {
+    if (sendQueue)
+        sendQueue->clear();
     delete mixTimer;
     mixTimer = nullptr;
 
@@ -119,6 +127,9 @@ void AudioPipeline::stopCapture()
 
     audioBackend->stopCapture();
 
+    if (sendQueue)
+        sendQueue->clear();
+
     if (isSpeaking) {
         sendTrailingSilence();
         isSpeaking = false;
@@ -127,7 +138,7 @@ void AudioPipeline::stopCapture()
     }
 }
 
-void AudioPipeline::onAudioReceived(quint32 ssrc, uint16_t sequence, uint32_t /*timestamp*/, const QByteArray &opusData)
+void AudioPipeline::onAudioReceived(quint32 ssrc, uint16_t sequence, uint32_t timestamp, const QByteArray &opusData)
 {
     auto it = speakers.find(ssrc);
     if (it == speakers.end()) {
@@ -143,7 +154,7 @@ void AudioPipeline::onAudioReceived(quint32 ssrc, uint16_t sequence, uint32_t /*
         it = inserted;
     }
 
-    it->second.jitterBuffer->push(sequence, opusData);
+    it->second.jitterBuffer->push(sequence, timestamp, opusData);
 }
 
 void AudioPipeline::setDeafened(bool deafened)
@@ -292,10 +303,15 @@ void AudioPipeline::setOpusPacketLossPercent(int percent)
         encoder->setPacketLossPercent(percent);
 }
 
-void AudioPipeline::onAudioCaptured(const QByteArray &pcmData)
+void AudioPipeline::onAudioCaptured(const QByteArray &pcmData, qint64 capturedAtMs)
 {
-    if (!encoder)
+    if (!encoder || pcmData.size() != AUDIO_FRAME_SIZE)
         return;
+    const auto age = monotonicMilliseconds() - capturedAtMs;
+    if (age < 0 || age > AudioSendQueue::MaxAgeMs) {
+        ++staleBeforeEncode;
+        return;
+    }
 
     QByteArray frame = pcmData;
     float voiceProb = -1.0f;
@@ -338,16 +354,24 @@ void AudioPipeline::onAudioCaptured(const QByteArray &pcmData)
         return;
 
     QByteArray encoded = encoder->encode(frame);
-    if (!encoded.isEmpty())
-        emit encodedAudioReady(encoded, monotonicMilliseconds());
+    if (!encoded.isEmpty()) {
+        captureAges[captureAgeCount++ % captureAges.size()] = monotonicMilliseconds() - capturedAtMs;
+        submitEncodedAudio(encoded, capturedAtMs);
+    }
 }
 
 void AudioPipeline::onMixTick()
 {
+    const auto nowMs = monotonicMilliseconds();
+    if (lastMixMs)
+        maxMixLatenessMs = std::max(maxMixLatenessMs, nowMs - lastMixMs - MIX_TIMER_INTERVAL_MS);
+    lastMixMs = nowMs;
+    publishDiagnostics(nowMs);
     if (deafened || !audioBackend)
         return;
 
     const unsigned int underruns = audioBackend->takePlaybackUnderruns();
+    measuredUnderruns += underruns;
     if (underruns > 0) {
         playbackTargetFrameCount = std::min(MAX_PLAYBACK_TARGET_FRAMES,
                                             playbackTargetFrameCount + 1);
@@ -485,11 +509,45 @@ float AudioPipeline::computeRms(const int16_t *samples, int count)
     return static_cast<float>(std::sqrt(sum / count));
 }
 
+void AudioPipeline::submitEncodedAudio(const QByteArray &data, qint64 capturedAtMs, bool silence)
+{
+    if (sendQueue && sendQueue->push(data, capturedAtMs, silence))
+        emit audioPacketsAvailable();
+}
+
+void AudioPipeline::publishDiagnostics(qint64 nowMs)
+{
+    if (!audioBackend || nowMs - lastDiagnosticsMs < 5000)
+        return;
+    auto ages = captureAges;
+    const auto count = std::min<size_t>(captureAgeCount, ages.size());
+    std::sort(ages.begin(), ages.begin() + count);
+    auto percentile = [&](unsigned p) -> qint64 {
+        return count ? ages[(count - 1) * p / 100] : 0;
+    };
+    QJsonObject stats{
+        {"capture_to_encode_p50_ms", double(percentile(50))},
+        {"capture_to_encode_p95_ms", double(percentile(95))},
+        {"capture_to_encode_p99_ms", double(percentile(99))},
+        {"capture_dropped_frames", double(audioBackend->captureDroppedFrames())},
+        {"stale_before_encode", double(staleBeforeEncode)},
+        {"send_queue_dropped_frames", double(sendQueue ? sendQueue->droppedCount() : 0)},
+        {"playback_underruns", double(measuredUnderruns)},
+        {"playback_queued_ms", double(audioBackend->queuedPlaybackFrames()) * 1000 / AUDIO_SAMPLE_RATE},
+        {"mix_max_lateness_ms", double(maxMixLatenessMs)},
+        {"capture_age_samples", double(count)}
+    };
+    emit diagnosticsUpdated(stats);
+    captureAgeCount = 0;
+    maxMixLatenessMs = 0;
+    lastDiagnosticsMs = nowMs;
+}
+
 void AudioPipeline::sendTrailingSilence()
 {
     QByteArray silence(reinterpret_cast<const char *>(OPUS_SILENCE), sizeof(OPUS_SILENCE));
     for (int i = 0; i < TRAILING_SILENCE_FRAMES; i++)
-        emit encodedAudioReady(silence, monotonicMilliseconds());
+        submitEncodedAudio(silence, monotonicMilliseconds(), true);
 }
 
 } // namespace Audio

@@ -31,6 +31,7 @@ struct VoiceReady : Core::JsonUtils::JsonObject
     Field<QString> ip;
     Field<int> port;
     Field<QStringList> modes;
+    QJsonArray streams;
 
     static VoiceReady fromJson(const QJsonObject &obj)
     {
@@ -39,6 +40,7 @@ struct VoiceReady : Core::JsonUtils::JsonObject
         get(obj, "ip", ready.ip);
         get(obj, "port", ready.port);
         get(obj, "modes", ready.modes);
+        ready.streams = obj.value("streams").toArray();
         return ready;
     }
 };
@@ -98,6 +100,7 @@ struct SessionDescription : Core::JsonUtils::JsonObject
     Field<QString> mode;
     Field<QByteArray> secretKey;
     Field<int, true> daveProtocolVersion;
+    Field<QString, true> videoCodec;
 
     static SessionDescription fromJson(const QJsonObject &obj)
     {
@@ -105,6 +108,7 @@ struct SessionDescription : Core::JsonUtils::JsonObject
         get(obj, "mode", desc.mode);
         get(obj, "secret_key", desc.secretKey);
         get(obj, "dave_protocol_version", desc.daveProtocolVersion);
+        get(obj, "video_codec", desc.videoCodec);
         return desc;
     }
 };
@@ -141,6 +145,7 @@ struct ClientConnectData : Core::JsonUtils::JsonObject
     Field<Core::Snowflake> userId;
     Field<quint32> audioSsrc;
     Field<quint32> videoSsrc;
+    QJsonArray streams;
 
     static ClientConnectData fromJson(const QJsonObject &obj)
     {
@@ -148,6 +153,7 @@ struct ClientConnectData : Core::JsonUtils::JsonObject
         get(obj, "user_id", data.userId);
         get(obj, "audio_ssrc", data.audioSsrc);
         get(obj, "video_ssrc", data.videoSsrc);
+        data.streams = obj.value("streams").toArray();
         return data;
     }
 };
