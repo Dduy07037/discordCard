@@ -1,0 +1,487 @@
+#include "AccountsWindow.hpp"
+
+#include <QMessageBox>
+#include <QRandomGenerator>
+
+#include "Core/Session.hpp"
+#include "Core/TokenStore.hpp"
+#include "Core/TokenUtils.hpp"
+#include "Core/Theme/Manager.hpp"
+#include "Core/Theme/Tokens.hpp"
+#include "Discord/CdnUrls.hpp"
+#include "UI/Dialogs/QRLoginDialog.hpp"
+
+namespace Acheron {
+namespace UI {
+
+using namespace Acheron::Core;
+
+AccountsWindow::AccountsWindow(Session *session, AccountsModel *sharedModel, QWidget *parent)
+    : QWidget(parent, Qt::Window), session(session)
+{
+    setWindowTitle(tr("Manage Accounts"));
+    setMinimumSize(640, 420);
+    resize(760, 500);
+
+    this->model = sharedModel;
+
+    setupUi();
+}
+
+void AccountsWindow::setupUi()
+{
+    setObjectName("accountsWindow");
+    QHBoxLayout *mainLayout = new QHBoxLayout(this);
+    mainLayout->setContentsMargins(16, 16, 16, 16);
+    mainLayout->setSpacing(16);
+
+    QWidget *leftPane = new QWidget(this);
+    leftPane->setObjectName("accountsListPane");
+    QVBoxLayout *leftLayout = new QVBoxLayout(leftPane);
+    leftLayout->setContentsMargins(0, 0, 0, 0);
+    leftLayout->setSpacing(10);
+
+    auto *accountsTitle = new QLabel(tr("Accounts"), leftPane);
+    accountsTitle->setObjectName("accountsTitle");
+    leftLayout->addWidget(accountsTitle);
+
+    listView = new QListView(this);
+    listView->setObjectName("accountsList");
+    listView->setModel(model);
+    listView->setIconSize(QSize(32, 32));
+    listView->setDragEnabled(true);
+    listView->setAcceptDrops(true);
+    listView->setDropIndicatorShown(true);
+    listView->setDragDropMode(QAbstractItemView::InternalMove);
+
+    listView->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(listView, &QListView::customContextMenuRequested, this,
+            &AccountsWindow::onContextMenuRequested);
+
+    leftLayout->addWidget(listView);
+
+    QHBoxLayout *btnLayout = new QHBoxLayout();
+    QPushButton *addBtn = new QPushButton(tr("Add"), this);
+    QPushButton *qrBtn = new QPushButton(tr("Log in with QR Code"), this);
+    removeButton = new QPushButton(tr("Remove"), this);
+    removeButton->setObjectName("dangerButton");
+    removeButton->setEnabled(false);
+    btnLayout->addWidget(addBtn);
+    btnLayout->addWidget(qrBtn);
+    btnLayout->addWidget(removeButton);
+    leftLayout->addLayout(btnLayout);
+
+    QWidget *rightPane = new QWidget(this);
+    rightPane->setObjectName("accountDetailsPane");
+    QVBoxLayout *rightLayout = new QVBoxLayout(rightPane);
+    rightLayout->setContentsMargins(20, 0, 0, 0);
+    rightLayout->setSpacing(14);
+
+    auto *detailsTitle = new QLabel(tr("Account details"), rightPane);
+    detailsTitle->setObjectName("accountsTitle");
+    rightLayout->addWidget(detailsTitle);
+
+    emptyStateLabel = new QLabel(tr("Select an account"), rightPane);
+    emptyStateLabel->setObjectName("emptyStateLabel");
+    emptyStateLabel->setAlignment(Qt::AlignCenter);
+    rightLayout->addWidget(emptyStateLabel);
+
+    detailsContainer = new QWidget(rightPane);
+
+    QVBoxLayout *containerLayout = new QVBoxLayout(detailsContainer);
+    containerLayout->setContentsMargins(0, 0, 0, 0);
+
+    detailAvatar = new QLabel(detailsContainer);
+    detailAvatar->setFixedSize(64, 64);
+    detailAvatar->setScaledContents(true);
+
+    QHBoxLayout *avLayout = new QHBoxLayout();
+    avLayout->addStretch();
+    avLayout->addWidget(detailAvatar);
+    avLayout->addStretch();
+
+    containerLayout->addLayout(avLayout);
+
+    QFormLayout *form = new QFormLayout();
+
+    detailDisplayName = new QLabel(detailsContainer);
+    detailUsername = new QLabel(detailsContainer);
+    detailId = new QLabel(detailsContainer);
+    detailStatus = new QLabel(detailsContainer);
+    detailStatus->setStyleSheet("font-weight: 650;");
+
+    autoConnectCheck = new QCheckBox(tr("Connect on startup"), detailsContainer);
+    autoConnectCheck->setToolTip(tr("Connect this account automatically when Acheron starts"));
+
+    proxyEdit = new ProxyLineEdit(detailsContainer);
+    proxyEdit->setToolTip(tr("Can only be changed while disconnected. Voice requires a SOCKS5 proxy."));
+    proxyApplyButton = new QPushButton(tr("Apply"), detailsContainer);
+
+    QHBoxLayout *proxyLayout = new QHBoxLayout();
+    proxyLayout->addWidget(proxyEdit);
+    proxyLayout->addWidget(proxyApplyButton);
+
+    QHBoxLayout *actionBtnLayout = new QHBoxLayout();
+    connectButton = new QPushButton(tr("Connect"), detailsContainer);
+    disconnectButton = new QPushButton(tr("Disconnect"), detailsContainer);
+    actionBtnLayout->addWidget(connectButton);
+    actionBtnLayout->addWidget(disconnectButton);
+
+    form->addRow(tr("Display Name:"), detailDisplayName);
+    form->addRow(tr("Status:"), detailStatus);
+    form->addRow(tr("Username:"), detailUsername);
+    form->addRow(tr("User ID:"), detailId);
+    form->addRow(autoConnectCheck);
+    form->addRow(tr("Actions:"), actionBtnLayout);
+    form->addRow(tr("Proxy:"), proxyLayout);
+
+    containerLayout->addLayout(form);
+    containerLayout->addStretch();
+    rightLayout->addWidget(detailsContainer);
+
+    detailsContainer->setVisible(false);
+
+    QSplitter *splitter = new QSplitter(Qt::Horizontal, this);
+    splitter->addWidget(leftPane);
+    splitter->addWidget(rightPane);
+    mainLayout->addWidget(splitter);
+
+    connect(addBtn, &QPushButton::clicked, this, &AccountsWindow::onAddClicked);
+    connect(qrBtn, &QPushButton::clicked, this, &AccountsWindow::onQrLoginClicked);
+    connect(removeButton, &QPushButton::clicked, this, &AccountsWindow::onRemoveClicked);
+
+    connect(listView->selectionModel(), &QItemSelectionModel::currentChanged, this,
+            &AccountsWindow::onSelectionChanged);
+
+    connect(model, &QAbstractListModel::dataChanged, this,
+            [this](const QModelIndex &topLeft, const QModelIndex &bottomRight) {
+                QModelIndex current = listView->selectionModel()->currentIndex();
+                if (current.isValid() && current.row() >= topLeft.row() &&
+                    current.row() <= bottomRight.row()) {
+                    void *ptr = current.data(AccountsModel::AccountObjectRole).value<void *>();
+                    updateDetails(static_cast<AccountInfo *>(ptr));
+                }
+            });
+
+    connect(connectButton, &QPushButton::clicked, this, &AccountsWindow::onConnectClicked);
+    connect(disconnectButton, &QPushButton::clicked, this, &AccountsWindow::onDisconnectClicked);
+
+    connect(autoConnectCheck, &QCheckBox::toggled, this, [this](bool checked) {
+        QModelIndex idx = listView->selectionModel()->currentIndex();
+        if (idx.isValid())
+            model->setAutoConnect(idx.row(), checked);
+    });
+
+    connect(proxyApplyButton, &QPushButton::clicked, this, &AccountsWindow::onProxyApplyClicked);
+    connect(proxyEdit, &QLineEdit::returnPressed, this, &AccountsWindow::onProxyApplyClicked);
+
+    const auto &theme = Core::Theme::Manager::instance();
+    setStyleSheet(QStringLiteral(
+            "#accountsWindow { background: palette(window); }"
+            "#accountsTitle { color: palette(window-text); font-size: 17px; font-weight: 650; }"
+            "#accountsList { background: palette(base); border: 1px solid palette(mid); border-radius: 8px; padding: 4px; }"
+            "#emptyStateLabel { color: palette(placeholder-text); }"
+            "#dangerButton:hover { color: %1; border-color: %2; }")
+                          .arg(theme.color(Core::Theme::Token::HighlightedText).name(),
+                               theme.color(Core::Theme::Token::Danger).name()));
+}
+
+void AccountsWindow::onProxyApplyClicked()
+{
+    QModelIndex idx = listView->selectionModel()->currentIndex();
+    if (!idx.isValid())
+        return;
+
+    std::optional<Core::ProxyConfig> proxy = proxyEdit->parseOrWarn();
+    if (!proxy)
+        return;
+
+    model->setProxy(idx.row(), *proxy);
+    proxyEdit->setText(proxy->toString());
+}
+
+void AccountsWindow::performConnect(int row)
+{
+    QModelIndex idx = model->index(row, 0);
+    if (!idx.isValid())
+        return;
+
+    auto *info =
+            static_cast<AccountInfo *>(idx.data(AccountsModel::AccountObjectRole).value<void *>());
+    if (!info)
+        return;
+
+    session->connectAccount(info->id);
+}
+
+void AccountsWindow::performDisconnect(int row)
+{
+    QModelIndex idx = model->index(row, 0);
+    if (!idx.isValid())
+        return;
+
+    auto *info =
+            static_cast<AccountInfo *>(idx.data(AccountsModel::AccountObjectRole).value<void *>());
+    if (!info)
+        return;
+
+    session->disconnectAccount(info->id);
+}
+
+void AccountsWindow::onAddClicked()
+{
+    TokenInputDialog dlg(tr("Add Account"), tr("Enter your token:"), this,
+                         TokenInputDialog::ProxyField::Shown);
+    if (dlg.exec() != QDialog::Accepted) {
+        return;
+    }
+
+    QString token = dlg.getToken();
+    if (token.isEmpty())
+        return;
+
+    Snowflake userId = TokenUtils::getIdAndCheckToken(token);
+    if (!userId.isValid()) {
+        // todo: complain
+        return;
+    }
+
+    AccountInfo acc;
+    acc.id = userId;
+
+    acc.displayName = "unknown";
+    acc.username = "unknown";
+    acc.token = token;
+    acc.proxy = dlg.getProxy();
+
+    // acc.avatar =
+
+    model->addAccount(acc);
+}
+
+void AccountsWindow::onQrLoginClicked()
+{
+    ProxyInputDialog proxyDlg(tr("QR Login"),
+                              tr("Proxy for this account (optional). Leave empty to connect directly."),
+                              this);
+    if (proxyDlg.exec() != QDialog::Accepted)
+        return;
+
+    QRLoginDialog dlg(session, proxyDlg.getProxy(), this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    QString token = dlg.getToken();
+    if (token.isEmpty())
+        return;
+
+    Snowflake userId = TokenUtils::getIdAndCheckToken(token);
+    if (!userId.isValid()) {
+        QMessageBox::warning(this, tr("Login Failed"), tr("Please try again."));
+        return;
+    }
+
+    AccountInfo acc;
+    acc.id = userId;
+    acc.token = token;
+    acc.username = dlg.getUsername().isEmpty() ? QStringLiteral("unknown") : dlg.getUsername();
+    acc.displayName = acc.username;
+    acc.proxy = proxyDlg.getProxy();
+
+    model->addAccount(acc);
+}
+
+void AccountsWindow::onContextMenuRequested(const QPoint &pos)
+{
+    QModelIndex index = listView->indexAt(pos);
+    if (!index.isValid())
+        return;
+
+    ConnectionState state = index.data(AccountsModel::ConnectionStateRole).value<ConnectionState>();
+
+    QMenu menu(this);
+    QAction *actConnect = menu.addAction("Connect");
+    QAction *actDisconnect = menu.addAction("Disconnect");
+    menu.addSeparator();
+    QAction *actAutoConnect = menu.addAction("Connect on Startup");
+    actAutoConnect->setCheckable(true);
+    actAutoConnect->setChecked(index.data(AccountsModel::AutoConnectRole).toBool());
+    menu.addSeparator();
+    QAction *actSetToken = menu.addAction("Set Token");
+    menu.addSeparator();
+    QAction *actRemove = menu.addAction("Remove Account");
+
+    if (state == ConnectionState::Connected || state == ConnectionState::Connecting)
+        actConnect->setEnabled(false);
+#ifndef ACHERON_MULTI_ACCOUNT
+    else if (session->hasActiveConnection())
+        actConnect->setEnabled(false);
+#endif
+    if (state == ConnectionState::Disconnected)
+        actDisconnect->setEnabled(false);
+
+    if (state != ConnectionState::Disconnected)
+        actSetToken->setEnabled(false);
+
+    QAction *selected = menu.exec(listView->viewport()->mapToGlobal(pos));
+
+    if (selected == actConnect)
+        performConnect(index.row());
+    else if (selected == actDisconnect)
+        performDisconnect(index.row());
+    else if (selected == actAutoConnect)
+        model->setAutoConnect(index.row(), actAutoConnect->isChecked());
+    else if (selected == actSetToken)
+        onSetTokenRequested(index.row());
+    else if (selected == actRemove)
+        model->removeAccount(index.row());
+}
+
+void AccountsWindow::onSetTokenRequested(int row)
+{
+    QModelIndex idx = model->index(row, 0);
+    if (!idx.isValid())
+        return;
+
+    auto *info =
+            static_cast<AccountInfo *>(idx.data(AccountsModel::AccountObjectRole).value<void *>());
+    if (!info)
+        return;
+
+    const QString accountLabel = info->displayName.isEmpty() ? info->username : info->displayName;
+
+    TokenInputDialog dlg(tr("Set Token"), tr("Enter the new token for %1:").arg(accountLabel), this);
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    QString newToken = dlg.getToken();
+    if (newToken.isEmpty())
+        return;
+
+    Snowflake tokenUserId = TokenUtils::getIdAndCheckToken(newToken);
+    if (!tokenUserId.isValid()) {
+        QMessageBox::warning(this, tr("Invalid Token"),
+                             tr("The token couldn't be parsed. Make sure you copied the token correctly."));
+        return;
+    }
+
+    if (tokenUserId != info->id) {
+        QMessageBox::warning(this, tr("Token Mismatch"),
+                             tr("This token belongs to user ID %1, but this account is %2. "
+                                "Tokens are bound to a specific user. Use \"Add\" to create a "
+                                "separate account for a different user.")
+                                     .arg(static_cast<quint64>(tokenUserId))
+                                     .arg(static_cast<quint64>(info->id)));
+        return;
+    }
+
+    if (!TokenStore::saveToken(info->id, newToken)) {
+        QMessageBox::critical(this, tr("Token Save Failed"),
+                              tr("Failed to save the token."));
+        return;
+    }
+
+    QString followup;
+    if (info->state == ConnectionState::Connected)
+        followup = tr(" Disconnect and reconnect this account for the new token to take effect.");
+
+    QMessageBox::information(this, tr("Token Updated"),
+                             tr("Token saved for %1.").arg(accountLabel) + followup);
+}
+
+void AccountsWindow::onSelectionChanged(const QModelIndex &current, const QModelIndex &prev)
+{
+    if (!current.isValid()) {
+        detailsContainer->setVisible(false);
+        emptyStateLabel->setVisible(true);
+        removeButton->setEnabled(false);
+        return;
+    }
+    void *ptr = current.data(AccountsModel::AccountObjectRole).value<void *>();
+    updateDetails(static_cast<AccountInfo *>(ptr));
+    detailsContainer->setVisible(true);
+    emptyStateLabel->setVisible(false);
+    removeButton->setEnabled(true);
+}
+
+void AccountsWindow::updateDetails(const AccountInfo *info)
+{
+    if (!info)
+        return;
+
+    const QSize desiredSize(64, 64);
+    QUrl TEMPORARY = Discord::Cdn::userAvatar(info->id, info->avatar, desiredSize.width());
+
+    session->getImageManager()->assign(detailAvatar, TEMPORARY, desiredSize, info->id);
+    detailDisplayName->setText(info->displayName);
+    detailUsername->setText(info->username);
+    detailId->setText(QString::number(info->id));
+
+    QSignalBlocker autoConnectBlocker(autoConnectCheck);
+    autoConnectCheck->setChecked(info->autoConnect);
+
+    if (!proxyEdit->hasFocus())
+        proxyEdit->setText(info->proxy.toString());
+
+    const bool proxyEditable = info->state == ConnectionState::Disconnected;
+    proxyEdit->setEnabled(proxyEditable);
+    proxyApplyButton->setEnabled(proxyEditable);
+
+    auto setStatus = [this](const QString &text, Core::Theme::Token token) {
+        detailStatus->setText(text);
+        detailStatus->setStyleSheet(
+                QStringLiteral("color: %1; font-weight: 650;")
+                        .arg(Core::Theme::Manager::instance().color(token).name()));
+    };
+
+    switch (info->state) {
+    case ConnectionState::Disconnected:
+        setStatus(tr("Disconnected"), Core::Theme::Token::Danger);
+#ifdef ACHERON_MULTI_ACCOUNT
+        connectButton->setEnabled(true);
+#else
+        connectButton->setEnabled(!session->hasActiveConnection());
+#endif
+        disconnectButton->setEnabled(false);
+        break;
+    case ConnectionState::Connecting:
+        setStatus(tr("Connecting..."), Core::Theme::Token::Warning);
+        connectButton->setEnabled(false);
+        disconnectButton->setEnabled(true);
+        break;
+    case ConnectionState::Connected:
+        setStatus(tr("Connected"), Core::Theme::Token::Success);
+        connectButton->setEnabled(false);
+        disconnectButton->setEnabled(true);
+        break;
+    case ConnectionState::Disconnecting:
+        setStatus(tr("Disconnecting..."), Core::Theme::Token::Warning);
+        connectButton->setEnabled(false);
+        disconnectButton->setEnabled(false);
+        break;
+    }
+}
+
+void AccountsWindow::onConnectClicked()
+{
+    QModelIndex idx = listView->selectionModel()->currentIndex();
+    if (idx.isValid())
+        performConnect(idx.row());
+}
+
+void AccountsWindow::onDisconnectClicked()
+{
+    QModelIndex idx = listView->selectionModel()->currentIndex();
+    if (idx.isValid())
+        performDisconnect(idx.row());
+}
+
+void AccountsWindow::onRemoveClicked()
+{
+    QModelIndex idx = listView->selectionModel()->currentIndex();
+    if (idx.isValid())
+        model->removeAccount(idx.row());
+}
+
+} // namespace UI
+} // namespace Acheron

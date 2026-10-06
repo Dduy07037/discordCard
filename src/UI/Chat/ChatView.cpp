@@ -1,0 +1,1157 @@
+#include "ChatView.hpp"
+
+#include <QMenu>
+#include <QTextDocument>
+#include <QTextCursor>
+#include <QToolTip>
+
+#include <algorithm>
+
+#include "Core/ImageManager.hpp"
+#include "Core/Theme/Icons.hpp"
+#include "Core/Theme/Manager.hpp"
+#include "Core/TimeUtils.hpp"
+#include "Discord/ChannelLink.hpp"
+#include "UI/Chat/InlineVideoController.hpp"
+#include "UI/Chat/MediaTarget.hpp"
+#include "UI/Dialogs/ConfirmPopup.hpp"
+#include "UI/ImageViewer.hpp"
+
+namespace Acheron {
+namespace UI {
+
+struct MediaHit
+{
+    QUrl imageUrl;
+    QPixmap preview;
+    bool spoilerHidden = false;
+    Snowflake attachmentId;
+
+    QUrl fileUrl;
+    QString filename;
+    qint64 fileSizeBytes = -1;
+
+    [[nodiscard]] bool isImage() const { return !imageUrl.isEmpty(); }
+    [[nodiscard]] bool isFile() const { return !fileUrl.isEmpty(); }
+};
+
+static MediaHit mediaAt(const ChatLayout::ResolvedLayout &resolved, const ChatLayout::HitRegion &region,
+                        const ChatModel &chatModel)
+{
+    using Kind = ChatLayout::HitRegion::Kind;
+    MediaHit hit;
+    auto embedImage = [&hit](const QUrl &url, const QPixmap &pixmap) {
+        hit.imageUrl = url;
+        hit.preview = pixmap;
+        hit.fileUrl = url;
+        hit.filename = QFileInfo(url.path()).fileName();
+    };
+
+    switch (region.kind) {
+    case Kind::AttachmentImage:
+    case Kind::AttachmentVideo:
+    case Kind::AttachmentAudio:
+    case Kind::AttachmentFile: {
+        if (region.index < 0 || region.index >= resolved.ctx.attachments.size())
+            break;
+        const AttachmentData &att = resolved.ctx.attachments[region.index];
+        if (att.isImage) {
+            hit.imageUrl = att.proxyUrl;
+            hit.preview = att.pixmap;
+            hit.spoilerHidden = att.isSpoiler && !chatModel.isSpoilerRevealed(att.id);
+        }
+        hit.attachmentId = att.id;
+        hit.fileUrl = att.originalUrl;
+        hit.filename = att.filename;
+        hit.fileSizeBytes = att.fileSizeBytes;
+        break;
+    }
+    case Kind::EmbedThumbnail: {
+        if (region.index < 0 || region.index >= resolved.ctx.embeds.size())
+            break;
+        const EmbedData &embed = resolved.ctx.embeds[region.index];
+        if (!embed.thumbnail.isNull())
+            embedImage(embed.thumbnailUrl, embed.thumbnail);
+        break;
+    }
+    case Kind::EmbedImage: {
+        if (region.index < 0 || region.index >= resolved.ctx.embeds.size())
+            break;
+        const EmbedData &embed = resolved.ctx.embeds[region.index];
+        if (region.subIndex >= 0 && region.subIndex < embed.images.size())
+            embedImage(embed.images[region.subIndex].url, embed.images[region.subIndex].pixmap);
+        break;
+    }
+    default:
+        break;
+    }
+    return hit;
+}
+
+static constexpr int LoadMoreThreshold = 200;
+
+ChatView::ChatView(QWidget *parent) : QListView(parent), hoveredRow(-1), hoveredChar(-1)
+{
+    setMouseTracking(true);
+    setSelectionMode(QAbstractItemView::NoSelection);
+    setUniformItemSizes(false);
+    setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    verticalScrollBar()->setSingleStep(10);
+    setAutoScroll(false);
+    setFocusPolicy(Qt::StrongFocus);
+    setAcceptDrops(true);
+    viewport()->setAcceptDrops(true);
+
+    inlineEditWidget = new QTextEdit(viewport());
+    inlineEditWidget->setVisible(false);
+    inlineEditWidget->setFrameStyle(QFrame::Box);
+    inlineEditWidget->setLineWidth(2);
+    inlineEditWidget->installEventFilter(this);
+
+    video = new InlineVideoController(this);
+
+    jumpToPresentBar = new JumpToPresentBar(this);
+    jumpToPresentBar->setVisible(false);
+    connect(jumpToPresentBar, &JumpToPresentBar::clicked, this, &ChatView::jumpToPresent);
+
+    auto *highlightFade = new QVariantAnimation(this);
+    highlightFade->setDuration(1000);
+    highlightFade->setStartValue(1.0);
+    highlightFade->setEndValue(0.0);
+    highlightFade->setEasingCurve(QEasingCurve::OutQuad);
+    connect(highlightFade, &QVariantAnimation::valueChanged, this, [this](const QVariant &value) {
+        highlightAlpha = value.toReal();
+        int row = highlightedRow();
+        if (row >= 0)
+            update(model()->index(row, 0));
+    });
+
+    highlightAnimation = new QSequentialAnimationGroup(this);
+    highlightAnimation->addPause(1200);
+    highlightAnimation->addAnimation(highlightFade);
+    connect(highlightAnimation, &QAbstractAnimation::finished, this, [this]() {
+        highlightedMessageId = Core::Snowflake::Invalid;
+        highlightAlpha = 0.0;
+        viewport()->update();
+    });
+
+    connect(verticalScrollBar(), &QScrollBar::valueChanged, this, &ChatView::onScrollBarValueChanged);
+    connect(verticalScrollBar(), &QScrollBar::rangeChanged, this, &ChatView::updateJumpToPresentBar);
+}
+
+bool ChatView::hasTextSelection() const
+{
+    return selectionAnchor.isValid() && selectionHead.isValid() && selectionAnchor != selectionHead;
+}
+
+ChatCursor ChatView::selectionStart() const
+{
+    return (selectionAnchor < selectionHead) ? selectionAnchor : selectionHead;
+}
+
+ChatCursor ChatView::selectionEnd() const
+{
+    return (selectionAnchor < selectionHead) ? selectionHead : selectionAnchor;
+}
+
+void ChatView::setModel(QAbstractItemModel *model)
+{
+    QListView::setModel(model);
+
+    video->attachModel(model);
+
+    connect(model, &QAbstractItemModel::modelReset, this, &ChatView::onModelReset);
+    if (auto *chatModel = qobject_cast<ChatModel *>(model))
+        connect(chatModel, &ChatModel::atLatestChanged, this, &ChatView::onAtLatestChanged);
+
+    connect(model, &QAbstractItemModel::rowsAboutToBeInserted, this,
+            &ChatView::onRowsAboutToBeInserted);
+    connect(model, &QAbstractItemModel::rowsInserted, this, &ChatView::onRowsInserted);
+    connect(model, &QAbstractItemModel::dataChanged, this, &ChatView::onDataChanged);
+}
+
+void ChatView::resizeEvent(QResizeEvent *event)
+{
+    video->invalidateRects();
+
+    QListView::resizeEvent(event);
+    positionJumpToPresentBar();
+}
+
+void ChatView::paintEvent(QPaintEvent *event)
+{
+    video->setPaintDamage(event->rect());
+    QListView::paintEvent(event);
+    video->setPaintDamage(QRect());
+}
+
+void ChatView::mousePressEvent(QMouseEvent *event)
+{
+    if (event->button() == Qt::LeftButton) {
+        QPoint pos = event->pos();
+        QModelIndex idx = indexAt(pos);
+        auto resolved = ChatLayout::resolveLayout(this, idx);
+        auto region = ChatLayout::hitTest(resolved, pos);
+
+        const auto target = region ? MediaTargets::forRegion(resolved, *region) : MediaTarget();
+        if (target.isValid()) {
+            clearSelection();
+            video->press(target, pos);
+            return;
+        }
+
+        int charPos = ChatLayout::hitTestCharIndex(resolved, pos);
+
+        if (charPos >= 0) {
+            selectionAnchor = { idx.row(), charPos };
+            selectionHead = selectionAnchor;
+            viewport()->update();
+        } else {
+            clearSelection();
+        }
+    }
+    QListView::mousePressEvent(event);
+}
+
+void ChatView::mouseMoveEvent(QMouseEvent *event)
+{
+    QPoint pos = event->pos();
+
+    if (video->dragging()) {
+        video->updateDrag(pos);
+        return;
+    }
+
+    QModelIndex idx = indexAt(pos);
+
+    bool inSelectionDrag = (event->buttons() & Qt::LeftButton) && selectionAnchor.isValid();
+    if (inSelectionDrag) {
+        int currentRow = idx.isValid() ? idx.row() : (model()->rowCount() - 1);
+        if (currentRow < 0)
+            return;
+
+        if (!idx.isValid())
+            idx = model()->index(currentRow, 0);
+    }
+
+    ChatLayout::ResolvedLayout resolved = ChatLayout::resolveLayout(this, idx);
+
+    if (inSelectionDrag) {
+        const QRect &textRect = resolved.layout.textRect;
+
+        int newChar = -1;
+
+        if (pos.y() < textRect.top()) {
+            newChar = 0;
+        } else if (pos.y() > textRect.bottom()) {
+            QString content = idx.data(ChatModel::ContentRole).toString();
+            newChar = content.length();
+        } else {
+            if (pos.x() < textRect.left()) {
+                newChar = 0;
+            } else if (pos.x() > textRect.right()) {
+                QString content = idx.data(ChatModel::ContentRole).toString();
+                newChar = content.length();
+            } else {
+                newChar = ChatLayout::hitTestCharIndex(resolved, pos);
+            }
+        }
+
+        if (newChar >= 0) {
+            selectionHead = { idx.row(), newChar };
+            viewport()->update();
+        }
+    }
+
+    auto region = ChatLayout::hitTest(resolved, pos);
+
+    video->updateHover(region ? MediaTargets::forRegion(resolved, *region) : MediaTarget(), pos);
+
+    Qt::CursorShape shape = Qt::ArrowCursor;
+    int charPos = -1;
+    if (region) {
+        if (region->kind == ChatLayout::HitRegion::Kind::TextCursor) {
+            shape = Qt::IBeamCursor;
+            charPos = ChatLayout::hitTestCharIndex(resolved, pos);
+        } else {
+            shape = Qt::PointingHandCursor;
+        }
+    }
+    if (viewport()->cursor().shape() != shape)
+        viewport()->setCursor(shape);
+
+    bool overReplyBar = region && region->kind == ChatLayout::HitRegion::Kind::ReplyBar;
+    if (hoveredRow != idx.row() || hoveredChar != charPos || hoveredReplyBar != overReplyBar) {
+        if (hoveredRow != -1)
+            update(visualRect(model()->index(hoveredRow, 0)));
+        hoveredRow = idx.row();
+        hoveredChar = charPos;
+        hoveredReplyBar = overReplyBar;
+        if (hoveredRow != -1)
+            update(visualRect(idx));
+    }
+
+    QListView::mouseMoveEvent(event);
+}
+
+void ChatView::mouseReleaseEvent(QMouseEvent *event)
+{
+    if (event->button() != Qt::LeftButton) {
+        QListView::mouseReleaseEvent(event);
+        return;
+    }
+
+    QPoint pos = event->pos();
+
+    if (video->dragging()) {
+        video->endDrag();
+        return;
+    }
+
+    QModelIndex idx = indexAt(pos);
+    ChatLayout::ResolvedLayout resolved = ChatLayout::resolveLayout(this, idx);
+    auto region = ChatLayout::hitTest(resolved, pos);
+
+    auto *chatModel = qobject_cast<ChatModel *>(model());
+    if (!region || !chatModel) {
+        QListView::mouseReleaseEvent(event);
+        return;
+    }
+
+    using Kind = ChatLayout::HitRegion::Kind;
+
+    auto openExternalLink = [this](const QString &url) {
+        if (url.isEmpty())
+            return;
+        if (auto link = Discord::ChannelLink::parse(url)) {
+            if (link->messageId.isValid())
+                emit messageLinkClicked(link->channelId, link->messageId);
+            else
+                emit channelMentionClicked(link->channelId);
+            return;
+        }
+        ConfirmPopup dialog(tr("External Link"),
+                            QString(tr("Are you sure you want to open <b>%1</b>?")).arg(url),
+                            tr("Open Link"), this);
+        if (dialog.exec() == QDialog::Accepted)
+            QDesktopServices::openUrl(QUrl(url));
+    };
+
+    auto openImage = [this, chatModel](const MediaHit &hit) {
+        auto *viewer = new ImageViewer(imageManager, chatModel->getAccountId(), window());
+        viewer->showImage(hit.imageUrl, hit.preview);
+    };
+
+    switch (region->kind) {
+    case Kind::Reaction: {
+        if (hasTextSelection())
+            break;
+        if (region->index < 0 || region->index >= resolved.ctx.reactions.size())
+            break;
+        Snowflake channelId = chatModel->getActiveChannelId();
+        Snowflake messageId = idx.data(ChatModel::MessageIdRole).toULongLong();
+        const ReactionData &r = resolved.ctx.reactions[region->index];
+        QString emojiStr = r.emojiId.isValid() ? (r.emojiName + ":" + QString::number(r.emojiId))
+                                               : r.emojiName;
+        emit toggleReactionClicked(channelId, messageId, emojiStr, r.me, r.isBurst);
+        break;
+    }
+
+    case Kind::AttachmentVideo:
+    case Kind::AttachmentAudio: {
+        const auto target = MediaTargets::forRegion(resolved, *region);
+        if (!target.isValid())
+            break;
+
+        if (target.spoilered) {
+            chatModel->revealSpoiler(target.attachmentId);
+            break;
+        }
+
+        video->release(target, idx, pos);
+        break;
+    }
+
+    case Kind::AttachmentImage:
+    case Kind::AttachmentFile: {
+        MediaHit hit = mediaAt(resolved, *region, *chatModel);
+        if (hit.spoilerHidden) {
+            chatModel->revealSpoiler(hit.attachmentId);
+        } else if (hit.isImage()) {
+            openImage(hit);
+        } else if (hit.isFile()) {
+            ConfirmPopup dialog(tr("Open File"),
+                                QString(tr("Do you want to open <b>%1</b> (%2) in your browser?"))
+                                        .arg(hit.filename)
+                                        .arg(ChatLayout::formatFileSize(hit.fileSizeBytes)),
+                                tr("Open"), this);
+            if (dialog.exec() == QDialog::Accepted)
+                QDesktopServices::openUrl(hit.fileUrl);
+        }
+        break;
+    }
+
+    case Kind::EmbedThumbnail: {
+        MediaHit hit = mediaAt(resolved, *region, *chatModel);
+        if (hit.isImage())
+            openImage(hit);
+        else
+            openExternalLink(region->url);
+        break;
+    }
+
+    case Kind::EmbedImage: {
+        MediaHit hit = mediaAt(resolved, *region, *chatModel);
+        if (hit.isImage())
+            openImage(hit);
+        break;
+    }
+
+    case Kind::EmbedVideoThumbnail: {
+        const auto target = MediaTargets::forRegion(resolved, *region);
+        if (target.isValid())
+            video->release(target, idx, pos);
+        else
+            openExternalLink(region->url);
+        break;
+    }
+
+    case Kind::EmbedAuthor:
+    case Kind::EmbedTitle:
+    case Kind::EmbedLink:
+        openExternalLink(region->url);
+        break;
+
+    case Kind::ForwardOrigin:
+    case Kind::TextLink:
+        if (region->url.startsWith("acheron://channel/")) {
+            bool ok = false;
+            quint64 id = region->url.mid(18).toULongLong(&ok);
+            if (ok)
+                emit channelMentionClicked(Core::Snowflake(id));
+        } else {
+            openExternalLink(region->url);
+        }
+        break;
+
+    case Kind::ReplyBar:
+        if (!hasTextSelection() && resolved.ctx.replyData.referencedMessageId.isValid())
+            jumpToMessage(resolved.ctx.replyData.referencedMessageId);
+        break;
+
+    case Kind::TextCursor:
+    case Kind::Avatar:
+    case Kind::UsernameHeader:
+    case Kind::EmbedDescription:
+    case Kind::EmbedFieldName:
+    case Kind::EmbedFieldValue:
+        break;
+    }
+
+    QListView::mouseReleaseEvent(event);
+}
+
+void ChatView::clearSelection()
+{
+    if (selectionAnchor.isValid()) {
+        selectionAnchor = { -1, -1 };
+        selectionHead = { -1, -1 };
+        viewport()->update();
+    }
+}
+
+void ChatView::leaveEvent(QEvent *event)
+{
+    bool needsUpdate = (hoveredRow != -1);
+    hoveredRow = -1;
+    hoveredChar = -1;
+    hoveredReplyBar = false;
+
+    if (!video->dragging())
+        video->clearHover();
+
+    if (needsUpdate) {
+        viewport()->update();
+    }
+
+    viewport()->unsetCursor();
+    QListView::leaveEvent(event);
+}
+
+bool ChatView::viewportEvent(QEvent *event)
+{
+    if (event->type() == QEvent::ToolTip) {
+        auto *helpEvent = static_cast<QHelpEvent *>(event);
+        QModelIndex idx = indexAt(helpEvent->pos());
+
+        QDateTime editedTime = idx.data(ChatModel::EditedTimestampRole).toDateTime();
+        if (editedTime.isValid()) {
+            ChatLayout::ResolvedLayout resolved = ChatLayout::resolveLayout(this, idx);
+            auto markerRect = ChatLayout::editedMarkerRectAt(resolved, helpEvent->pos());
+            if (markerRect) {
+                QToolTip::showText(helpEvent->globalPos(),
+                                   tr("Edited %1").arg(Core::TimeUtils::absoluteTime(editedTime)),
+                                   viewport(), *markerRect);
+                return true;
+            }
+        }
+    }
+
+    return QListView::viewportEvent(event);
+}
+
+void ChatView::onHistoryRequestFinished()
+{
+    isFetchingTop = false;
+}
+
+void ChatView::onFutureRequestFinished(bool loadedMore)
+{
+    isFetchingBottom = false;
+
+    if (loadedMore)
+        QTimer::singleShot(0, this, &ChatView::maybeRequestFuture);
+}
+
+void ChatView::maybeRequestFuture()
+{
+    auto *bar = verticalScrollBar();
+    if (modelAtLatest() || isFetchingBottom || bar->maximum() - bar->value() >= LoadMoreThreshold)
+        return;
+    isFetchingBottom = true;
+    emit futureRequested();
+}
+
+void ChatView::onModelReset()
+{
+    isFetchingTop = false;
+    isFetchingBottom = false;
+    anchorIndex = QPersistentModelIndex();
+
+    auto *chatModel = qobject_cast<ChatModel *>(model());
+    bool hasJumpTarget = pendingJumpMessageId.isValid() && chatModel &&
+                         chatModel->rowForMessage(pendingJumpMessageId) >= 0;
+    if (!hasJumpTarget)
+        pendingJumpMessageId = Core::Snowflake::Invalid;
+
+    setAtBottom(!hasJumpTarget && modelAtLatest());
+
+    QTimer::singleShot(0, this, [this]() {
+        Core::Snowflake target = pendingJumpMessageId;
+        pendingJumpMessageId = Core::Snowflake::Invalid;
+        if (target.isValid() && scrollToMessage(target)) {
+            maybeRequestFuture();
+            return;
+        }
+        scrollToBottom();
+        setAtBottom(modelAtLatest());
+        updateJumpToPresentBar();
+    });
+}
+
+void ChatView::onAtLatestChanged(bool atLatest)
+{
+    if (atLatest) {
+        updateScrollState();
+        return;
+    }
+    setAtBottom(false);
+    updateJumpToPresentBar();
+}
+
+void ChatView::onRowsAboutToBeInserted(const QModelIndex &parent, int start, int end)
+{
+    if (start == 0) {
+        QPoint topPoint(5, 5);
+        QModelIndex topVisible = indexAt(topPoint);
+
+        if (topVisible.isValid()) {
+            anchorIndex = QPersistentModelIndex(topVisible);
+            anchorDistanceFromBottom = visualRect(topVisible).bottom();
+        }
+    }
+}
+
+void ChatView::onRowsInserted(const QModelIndex &parent, int start, int end)
+{
+    if (atBottom) {
+        scrollToBottom();
+    } else if (start == 0 && anchorIndex.isValid()) {
+        setUpdatesEnabled(false);
+
+        QTimer::singleShot(0, this, [this]() {
+            if (!anchorIndex.isValid()) {
+                setUpdatesEnabled(true);
+                return;
+            }
+
+            scrollTo(anchorIndex, QAbstractItemView::PositionAtTop);
+            QRect newRect = visualRect(anchorIndex);
+            int diff = newRect.bottom() - anchorDistanceFromBottom;
+            verticalScrollBar()->setValue(verticalScrollBar()->value() + diff);
+
+            anchorIndex = QPersistentModelIndex();
+            isFetchingTop = false;
+            setUpdatesEnabled(true);
+        });
+    }
+}
+
+void ChatView::onDataChanged(const QModelIndex &topLeft, const QModelIndex &bottomRight)
+{
+    if (!atBottom)
+        return;
+
+    int lastRow = model()->rowCount() - 1;
+    if (lastRow < 0 || bottomRight.row() < lastRow)
+        return;
+
+    scheduleDelayedItemsLayout();
+    scrollToBottom();
+}
+
+void ChatView::setAtBottom(bool value)
+{
+    if (atBottom == value)
+        return;
+    atBottom = value;
+    emit atBottomChanged(value);
+}
+
+void ChatView::onScrollBarValueChanged(int)
+{
+    updateScrollState();
+
+    if (underMouse())
+        video->refreshHoverAt(viewport()->mapFromGlobal(QCursor::pos()));
+}
+
+void ChatView::updateScrollState()
+{
+    auto *bar = verticalScrollBar();
+
+    setAtBottom(bar->value() >= bar->maximum() && modelAtLatest());
+
+    if (bar->value() < LoadMoreThreshold && !isFetchingTop) {
+        isFetchingTop = true;
+        emit historyRequested();
+    }
+
+    maybeRequestFuture();
+    updateJumpToPresentBar();
+}
+
+bool ChatView::modelAtLatest() const
+{
+    auto *chatModel = qobject_cast<const ChatModel *>(model());
+    return !chatModel || chatModel->isAtLatest();
+}
+
+int ChatView::highlightedRow() const
+{
+    if (!highlightedMessageId.isValid())
+        return -1;
+    auto *chatModel = qobject_cast<const ChatModel *>(model());
+    return chatModel ? chatModel->rowForMessage(highlightedMessageId) : -1;
+}
+
+bool ChatView::scrollToMessage(Core::Snowflake messageId)
+{
+    auto *chatModel = qobject_cast<ChatModel *>(model());
+    if (!chatModel)
+        return false;
+
+    int row = chatModel->rowForMessage(messageId);
+    if (row < 0)
+        return false;
+
+    scrollTo(chatModel->index(row, 0), QAbstractItemView::PositionAtCenter);
+    flashMessage(messageId);
+    return true;
+}
+
+void ChatView::flashMessage(Core::Snowflake messageId)
+{
+    highlightedMessageId = messageId;
+    highlightAlpha = 1.0;
+    highlightAnimation->stop();
+    highlightAnimation->start();
+    viewport()->update();
+}
+
+void ChatView::jumpToMessage(Core::Snowflake messageId)
+{
+    if (!messageId.isValid() || scrollToMessage(messageId))
+        return;
+
+    pendingJumpMessageId = messageId;
+    emit jumpRequested(messageId);
+}
+
+void ChatView::jumpToPresent()
+{
+    pendingJumpMessageId = Core::Snowflake::Invalid;
+
+    if (modelAtLatest())
+        scrollToBottom();
+    else
+        emit presentRequested();
+}
+
+void ChatView::positionJumpToPresentBar()
+{
+    constexpr int MinWidth = 284;
+    constexpr int SideMargin = 16;
+    constexpr int BottomMargin = 8;
+
+    jumpToPresentBar->ensurePolished();
+    QSize hint = jumpToPresentBar->sizeHint();
+    QRect area = viewport()->geometry();
+    int width = qBound(qMin(MinWidth, area.width() - 2 * SideMargin),
+                       qMax(MinWidth, hint.width()),
+                       area.width() - 2 * SideMargin);
+    jumpToPresentBar->setGeometry(area.left() + (area.width() - width) / 2,
+                                  area.bottom() + 1 - hint.height() - BottomMargin,
+                                  width,
+                                  hint.height());
+}
+
+void ChatView::updateJumpToPresentBar()
+{
+    constexpr int ScrolledUpThreshold = 120;
+
+    auto *bar = verticalScrollBar();
+    bool scrolledUp = bar->maximum() - bar->value() > ScrolledUpThreshold;
+    bool show = !modelAtLatest() || scrolledUp;
+    if (show == jumpToPresentBar->isVisible())
+        return;
+    if (show) {
+        positionJumpToPresentBar();
+        jumpToPresentBar->raise();
+    }
+    jumpToPresentBar->setVisible(show);
+}
+
+JumpToPresentBar::JumpToPresentBar(QWidget *parent) : QWidget(parent)
+{
+    setObjectName("jumpToPresentBar");
+    setAttribute(Qt::WA_StyledBackground);
+    setCursor(Qt::PointingHandCursor);
+
+    auto *layout = new QHBoxLayout(this);
+    layout->setContentsMargins(12, 6, 6, 6);
+    layout->setSpacing(12);
+
+    label = new QLabel(tr("You're viewing older messages"), this);
+    label->setAttribute(Qt::WA_TransparentForMouseEvents);
+    layout->addWidget(label, 1);
+
+    button = new QPushButton(tr("Jump To Present"), this);
+    button->setObjectName("jumpToPresentButton");
+    button->setCursor(Qt::PointingHandCursor);
+    button->setFocusPolicy(Qt::NoFocus);
+    layout->addWidget(button, 0);
+    connect(button, &QPushButton::clicked, this, &JumpToPresentBar::clicked);
+
+    applyTheme();
+    connect(&Core::Theme::Manager::instance(), &Core::Theme::Manager::themeChanged, this, &JumpToPresentBar::applyTheme);
+}
+
+void JumpToPresentBar::mousePressEvent(QMouseEvent *event)
+{
+    if (event->button() == Qt::LeftButton)
+        emit clicked();
+    QWidget::mousePressEvent(event);
+}
+
+void JumpToPresentBar::applyTheme()
+{
+    using namespace Core::Theme;
+    const auto &theme = Manager::instance();
+    QColor surface = theme.color(Token::ButtonBg);
+    QColor border = theme.color(Token::Divider);
+    QColor text = theme.color(Token::PrimaryText);
+    QColor accent = theme.color(Token::Highlight);
+    QColor accentText = theme.color(Token::HighlightedText);
+
+    button->setIcon(Icons::icon(Icons::Name::ArrowDown, Token::HighlightedText));
+    setStyleSheet(QStringLiteral(
+                          "#jumpToPresentBar { background: %1; border: 1px solid %2; border-radius: 8px; }"
+                          "#jumpToPresentBar QLabel { color: %3; font-weight: 500; background: transparent; }"
+                          "#jumpToPresentButton { background: %4; color: %5; border: none; border-radius: 4px; padding: 4px 10px; font-weight: 600; }"
+                          "#jumpToPresentButton:hover { background: %6; }")
+                          .arg(surface.name(), border.name(), text.name(), accent.name(), accentText.name(), accent.lighter(115).name()));
+    adjustSize();
+}
+
+void ChatView::setCurrentUserId(Core::Snowflake userId)
+{
+    currentUserId = userId;
+}
+
+void ChatView::setCanPinMessages(bool canPin)
+{
+    canPinMessages = canPin;
+}
+
+void ChatView::setCanManageMessages(bool canManage)
+{
+    canManageMessages = canManage;
+}
+
+void ChatView::contextMenuEvent(QContextMenuEvent *event)
+{
+    QModelIndex index = indexAt(event->pos());
+    if (!index.isValid())
+        return;
+
+    auto *chatModel = qobject_cast<ChatModel *>(model());
+    if (!chatModel)
+        return;
+
+    Core::Snowflake messageId = index.data(ChatModel::MessageIdRole).toULongLong();
+    Core::Snowflake authorId = index.data(ChatModel::UserIdRole).toULongLong();
+    Core::Snowflake channelId = chatModel->getActiveChannelId();
+    QString content = index.data(ChatModel::ContentRole).toString();
+    bool isOwnMessage = (authorId == currentUserId);
+
+    ChatLayout::ResolvedLayout resolved = ChatLayout::resolveLayout(this, index);
+    auto region = ChatLayout::hitTest(resolved, event->pos());
+    if (region && (region->kind == ChatLayout::HitRegion::Kind::Avatar || region->kind == ChatLayout::HitRegion::Kind::UsernameHeader)) {
+        emit userContextMenuRequested(authorId, event->globalPos());
+        return;
+    }
+
+    QMenu menu(this);
+
+    MediaHit hit = region ? mediaAt(resolved, *region, *chatModel) : MediaHit();
+    if (hit.isImage() && !hit.spoilerHidden) {
+        QAction *copyImageAction = menu.addAction(tr("Copy Image"));
+        connect(copyImageAction, &QAction::triggered, this, [this, hit]() {
+            copyImage(hit.imageUrl, hit.preview);
+        });
+    }
+    if (hit.isFile()) {
+        QAction *saveAction = menu.addAction(tr("Save As..."));
+        connect(saveAction, &QAction::triggered, this, [this, hit]() {
+            saveMedia(hit.fileUrl, hit.filename);
+        });
+    }
+    if (region && !region->url.isEmpty() && !region->url.startsWith(QLatin1String("acheron://"))) {
+        QString linkUrl = region->url;
+        QAction *copyLinkAction = menu.addAction(tr("Copy Link"));
+        connect(copyLinkAction, &QAction::triggered, this, [linkUrl]() {
+            QGuiApplication::clipboard()->setText(linkUrl);
+        });
+    }
+    if (!menu.isEmpty())
+        menu.addSeparator();
+
+    QAction *copyAction = menu.addAction(tr("Copy Text"));
+    copyAction->setShortcut(QKeySequence::Copy);
+    if (hasTextSelection()) {
+        connect(copyAction, &QAction::triggered, this, [this]() {
+            copySelectedText();
+        });
+    } else {
+        connect(copyAction, &QAction::triggered, this, [this, index]() {
+            copyMessageContent(index);
+        });
+    }
+
+    menu.addSeparator();
+
+    QAction *replyAction = menu.addAction(tr("Reply"));
+    connect(replyAction, &QAction::triggered, this, [this, channelId, messageId]() {
+        emit replyToMessageRequested(channelId, messageId);
+    });
+
+    if (isOwnMessage && !index.data(ChatModel::IsSystemMessageRole).toBool() &&
+        !index.data(ChatModel::IsForwardedRole).toBool()) {
+        QAction *editAction = menu.addAction(tr("Edit Message"));
+        connect(editAction, &QAction::triggered, this, [this, index]() {
+            startInlineEdit(index);
+        });
+    }
+
+    if (isOwnMessage || canManageMessages) {
+        QAction *deleteAction = menu.addAction(tr("Delete Message"));
+        connect(deleteAction, &QAction::triggered, this, [this, channelId, messageId]() {
+            emit deleteMessageRequested(channelId, messageId);
+        });
+    }
+
+    menu.addSeparator();
+
+    if (canPinMessages) {
+        QAction *pinAction = menu.addAction(tr("Pin Message"));
+        connect(pinAction, &QAction::triggered, this, [this, channelId, messageId]() {
+            emit pinMessageRequested(channelId, messageId);
+        });
+    }
+
+    QAction *reactAction = menu.addAction(tr("Add Reaction"));
+    connect(reactAction, &QAction::triggered, this, [this, channelId, messageId]() {
+        emit addReactionRequested(channelId, messageId);
+    });
+
+    bool isPending = index.data(ChatModel::IsPendingRole).toBool();
+    bool hasAttachments = !index.data(ChatModel::AttachmentsRole).isNull();
+    if (isOwnMessage && isPending && hasAttachments) {
+        menu.addSeparator();
+        QAction *cancelAction = menu.addAction(tr("Cancel Upload"));
+        connect(cancelAction, &QAction::triggered, this, [this, channelId, messageId]() {
+            emit cancelUploadRequested(channelId, messageId);
+        });
+    }
+
+    menu.addSeparator();
+    QAction *copyMessageLinkAction = menu.addAction(tr("Copy Message Link"));
+    connect(copyMessageLinkAction, &QAction::triggered, this, [chatModel, channelId, messageId]() {
+        Discord::ChannelLink link{ chatModel->getActiveGuildId(), channelId, messageId };
+        QGuiApplication::clipboard()->setText(link.toUrl());
+    });
+
+    QAction *copyIdAction = menu.addAction(tr("Copy Message ID"));
+    connect(copyIdAction, &QAction::triggered, this, [messageId]() {
+        QGuiApplication::clipboard()->setText(QString::number(quint64(messageId)));
+    });
+
+    menu.exec(event->globalPos());
+}
+
+void ChatView::keyPressEvent(QKeyEvent *event)
+{
+    if (event->matches(QKeySequence::Copy)) {
+        copySelectedText();
+        return;
+    }
+    QListView::keyPressEvent(event);
+}
+
+static bool hasLocalFiles(const QMimeData *mime)
+{
+    if (!mime->hasUrls())
+        return false;
+    const auto urls = mime->urls();
+    return std::any_of(urls.begin(), urls.end(),
+                       [](const QUrl &url) { return url.isLocalFile(); });
+}
+
+void ChatView::dragEnterEvent(QDragEnterEvent *event)
+{
+    if (hasLocalFiles(event->mimeData()))
+        event->acceptProposedAction();
+}
+
+void ChatView::dragMoveEvent(QDragMoveEvent *event)
+{
+    if (hasLocalFiles(event->mimeData()))
+        event->acceptProposedAction();
+}
+
+void ChatView::dropEvent(QDropEvent *event)
+{
+    if (!hasLocalFiles(event->mimeData()))
+        return;
+    event->acceptProposedAction();
+    emit filesDropped(event->mimeData()->urls());
+}
+
+void ChatView::copySelectedText()
+{
+    if (!hasTextSelection())
+        return;
+
+    ChatCursor start = selectionStart();
+    ChatCursor end = selectionEnd();
+
+    QString selectedText;
+    for (int row = start.row; row <= end.row; row++) {
+        QModelIndex idx = model()->index(row, 0);
+        QString html = idx.data(ChatModel::HtmlRole).toString();
+
+        QTextDocument doc;
+        doc.setHtml(html);
+
+        int docLength = doc.characterCount() - 1;
+        int startChar = (row == start.row) ? start.index : 0;
+        int endChar = (row == end.row) ? end.index : docLength;
+
+        startChar = qBound(0, startChar, docLength);
+        endChar = qBound(0, endChar, docLength);
+
+        if (startChar >= endChar && row == start.row && row == end.row)
+            continue;
+
+        QTextCursor cursor(&doc);
+        cursor.setPosition(startChar);
+        cursor.setPosition(endChar, QTextCursor::KeepAnchor);
+
+        QString rowText = cursor.selectedText();
+        rowText.replace(QChar(0x2029), '\n');
+
+        if (!selectedText.isEmpty())
+            selectedText += '\n';
+        selectedText += rowText;
+    }
+
+    if (!selectedText.isEmpty())
+        QGuiApplication::clipboard()->setText(selectedText);
+}
+
+void ChatView::copyMessageContent(const QModelIndex &index)
+{
+    QString content = index.data(ChatModel::ContentRole).toString();
+    if (!content.isEmpty())
+        QGuiApplication::clipboard()->setText(content);
+}
+
+void ChatView::copyImage(const QUrl &proxyUrl, const QPixmap &preview)
+{
+    auto *chatModel = qobject_cast<ChatModel *>(model());
+    if (!chatModel)
+        return;
+
+    QUrl fullQualityUrl = Core::ImageManager::fullQualityUrl(proxyUrl);
+    imageManager->fetch(fullQualityUrl, chatModel->getAccountId(), this, [preview](const QByteArray &data) {
+        QImage image = QImage::fromData(data);
+        if (image.isNull())
+            image = preview.toImage();
+        if (!image.isNull())
+            QGuiApplication::clipboard()->setImage(image);
+    });
+}
+
+void ChatView::saveMedia(const QUrl &url, const QString &filename)
+{
+    auto *chatModel = qobject_cast<ChatModel *>(model());
+    if (!chatModel)
+        return;
+
+    QString downloads = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    QString path = QFileDialog::getSaveFileName(this, tr("Save As"), QDir(downloads).filePath(filename));
+    if (!path.isEmpty())
+        imageManager->download(url, chatModel->getAccountId(), path);
+}
+
+void ChatView::startInlineEdit(const QModelIndex &index)
+{
+    if (!index.isValid())
+        return;
+
+    QString content = index.data(ChatModel::ContentRole).toString();
+    Core::Snowflake messageId = index.data(ChatModel::MessageIdRole).toULongLong();
+
+    currentEditingMessageId = messageId;
+    currentEditingIndex = index;
+
+    // Invalidate cached size so sizeHint returns the enlarged height
+    auto *m = const_cast<QAbstractItemModel *>(index.model());
+    m->setData(index, QSize(), ChatModel::CachedSizeRole);
+
+    // Force the view to re-query sizeHint for this row
+    scheduleDelayedItemsLayout();
+
+    // Position the edit widget after layout recalculates
+    QTimer::singleShot(0, this, [this, content]() {
+        if (!currentEditingIndex.isValid())
+            return;
+
+        QRect itemRect = visualRect(currentEditingIndex);
+        ChatLayout::ResolvedLayout resolved = ChatLayout::resolveLayout(this, currentEditingIndex);
+        const QRect &textRect = resolved.layout.textRect;
+
+        int editHeight = qMax(InlineEditMinHeight, itemRect.bottom() - textRect.top() - 4);
+        QRect editRect(textRect.left(), textRect.top(), textRect.width(), editHeight);
+
+        inlineEditWidget->setGeometry(editRect);
+        inlineEditWidget->setFont(resolved.ctx.font);
+        inlineEditWidget->setPlainText(content);
+        inlineEditWidget->setVisible(true);
+        inlineEditWidget->setFocus();
+        inlineEditWidget->selectAll();
+
+        scrollTo(currentEditingIndex, QAbstractItemView::EnsureVisible);
+    });
+}
+
+void ChatView::editLastOwnMessage()
+{
+    auto *chatModel = qobject_cast<ChatModel *>(model());
+    if (!chatModel || !currentUserId.isValid())
+        return;
+
+    for (int row = chatModel->rowCount() - 1; row >= 0; --row) {
+        QModelIndex index = chatModel->index(row, 0);
+        if (index.data(ChatModel::UserIdRole).toULongLong() != currentUserId)
+            continue;
+        if (index.data(ChatModel::IsPendingRole).toBool())
+            continue;
+        if (index.data(ChatModel::IsSystemMessageRole).toBool())
+            continue;
+        if (index.data(ChatModel::IsForwardedRole).toBool())
+            continue;
+        startInlineEdit(index);
+        return;
+    }
+}
+
+void ChatView::commitInlineEdit()
+{
+    if (!currentEditingIndex.isValid())
+        return;
+
+    QString newContent = inlineEditWidget->toPlainText().trimmed();
+    QString oldContent = currentEditingIndex.data(ChatModel::ContentRole).toString();
+
+    auto *chatModel = qobject_cast<ChatModel *>(model());
+    Core::Snowflake channelId = chatModel ? chatModel->getActiveChannelId() : Core::Snowflake::Invalid;
+    Core::Snowflake messageId = currentEditingMessageId;
+
+    cancelInlineEdit();
+
+    if (newContent.isEmpty())
+        emit deleteMessageRequested(channelId, messageId);
+    else if (newContent != oldContent)
+        emit editMessageRequested(channelId, messageId, newContent);
+}
+
+void ChatView::cancelInlineEdit()
+{
+    bool wasEditing = currentEditingIndex.isValid();
+    inlineEditWidget->setVisible(false);
+
+    QModelIndex editedIndex = currentEditingIndex;
+    currentEditingMessageId = Core::Snowflake::Invalid;
+    currentEditingIndex = QModelIndex();
+
+    if (wasEditing)
+        emit inlineEditFinished();
+
+    // Invalidate cached size so sizeHint returns the normal height
+    if (editedIndex.isValid()) {
+        auto *m = const_cast<QAbstractItemModel *>(editedIndex.model());
+        m->setData(editedIndex, QSize(), ChatModel::CachedSizeRole);
+        scheduleDelayedItemsLayout();
+    }
+}
+
+bool ChatView::eventFilter(QObject *obj, QEvent *event)
+{
+    if (obj == inlineEditWidget && event->type() == QEvent::KeyPress) {
+        QKeyEvent *keyEvent = static_cast<QKeyEvent *>(event);
+        if (keyEvent->key() == Qt::Key_Return && !(keyEvent->modifiers() & Qt::ShiftModifier)) {
+            commitInlineEdit();
+            return true;
+        }
+        if (keyEvent->key() == Qt::Key_Escape) {
+            cancelInlineEdit();
+            return true;
+        }
+    }
+    return QListView::eventFilter(obj, event);
+}
+
+} // namespace UI
+} // namespace Acheron

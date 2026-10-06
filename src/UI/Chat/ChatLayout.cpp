@@ -1,0 +1,1333 @@
+#include "ChatLayout.hpp"
+
+#include "UI/Chat/VideoControls.hpp"
+
+#include "Core/Theme/Fonts.hpp"
+#include "Core/Theme/Icons.hpp"
+#include "Core/Theme/Manager.hpp"
+#include "Core/Theme/Tokens.hpp"
+
+#include <QCoreApplication>
+#include <QPainter>
+#include <QGraphicsBlurEffect>
+#include <QGraphicsScene>
+#include <QGraphicsPixmapItem>
+#include <QTextBlock>
+#include <QUrl>
+
+namespace Acheron {
+namespace UI {
+namespace ChatLayout {
+
+QRect dateSeparatorRectForRow(const QRect &rowRect)
+{
+    return QRect(rowRect.left(), rowRect.top(), rowRect.width(), separatorHeight());
+}
+
+QString richTextStyleSheet()
+{
+    using Core::Theme::Manager;
+    using Core::Theme::Token;
+    const QColor link = Manager::instance().color(Token::LinkText);
+    const QColor mentionText = Manager::instance().color(Token::MentionText);
+    const QColor mentionBg = Manager::instance().color(Token::MentionBg);
+    const QString mentionBgRgba = QStringLiteral("rgba(%1, %2, %3, %4)")
+                                          .arg(mentionBg.red())
+                                          .arg(mentionBg.green())
+                                          .arg(mentionBg.blue())
+                                          .arg(QString::number(mentionBg.alphaF(), 'f', 3));
+    const QFont codeFont = Manager::instance().font(Core::Theme::FontRole::Code);
+    QString code = QStringLiteral("code { font-family: '%1';").arg(codeFont.family());
+    if (codeFont.pointSizeF() > 0)
+        code += QStringLiteral(" font-size: %1pt;").arg(codeFont.pointSizeF());
+    code += QStringLiteral(" }");
+
+    return QStringLiteral("a { color: %1; } "
+                          ".mention { color: %2; background-color: %3; text-decoration: none; } ")
+                   .arg(link.name(QColor::HexRgb))
+                   .arg(mentionText.name(QColor::HexRgb))
+                   .arg(mentionBgRgba) +
+           code;
+}
+
+static QString editedMarkerText()
+{
+    return QCoreApplication::translate("Acheron::UI::ChatLayout", "(edited)");
+}
+
+static QString editedMarkerHtml(const QPalette &palette)
+{
+    return QStringLiteral(R"(<span style="color: %1"> %2</span>)")
+            .arg(palette.text().color().darker(200).name(), editedMarkerText().toHtmlEscaped());
+}
+
+void setupDocument(QTextDocument &doc, const QString &htmlContent, const QFont &font, int textWidth)
+{
+    QString wrapped = QString("<div style=\"white-space: pre-wrap;\">%1</div>")
+                              .arg(htmlContent);
+
+    doc.setDefaultFont(font);
+    doc.setDefaultStyleSheet(richTextStyleSheet());
+
+    if (htmlContent.contains(QLatin1String("acheron-icon:view-thread"))) {
+        const QColor threadColor = Core::Theme::Manager::instance().color(Core::Theme::Token::LinkText);
+        doc.addResource(QTextDocument::ImageResource,
+                        QUrl(QStringLiteral("acheron-icon:view-thread")),
+                        Core::Theme::Icons::pixmap(Core::Theme::Icons::Name::Spool, 14, threadColor, 2.0));
+    }
+
+    if (htmlContent.contains(QLatin1String("acheron-icon:forwarded"))) {
+        const QColor mutedColor = Core::Theme::Manager::instance().color(Core::Theme::Token::PlaceholderText);
+        doc.addResource(QTextDocument::ImageResource,
+                        QUrl(QStringLiteral("acheron-icon:forwarded")),
+                        Core::Theme::Icons::pixmap(Core::Theme::Icons::Name::Forward, 12, mutedColor, 2.0));
+    }
+
+    if (htmlContent.contains(QLatin1String("acheron-icon:mention-"))) {
+        using namespace Core::Theme::Icons;
+        static const QList<QPair<QString, QString>> mentionIcons = {
+            { "hash", Name::Hash },
+            { "chevron", Name::ChevronRight },
+            { "message", Name::MessageCircle },
+            { "post", Name::FileText },
+            { "forum", Name::MessagesSquare },
+            { "thread", Name::Spool },
+            { "voice", Name::VolumeOn },
+            { "announcement", Name::Radio },
+            { "locked", Name::Lock },
+        };
+        const QColor mentionColor = Core::Theme::Manager::instance().color(Core::Theme::Token::MentionText);
+        for (const auto &icon : mentionIcons) {
+            QString url = "acheron-icon:mention-" + icon.first;
+            if (htmlContent.contains(url))
+                doc.addResource(QTextDocument::ImageResource, QUrl(url), pixmap(icon.second, 14, mentionColor, 2.0));
+        }
+    }
+
+    doc.setHtml(wrapped);
+    doc.setTextWidth(textWidth);
+    doc.setDocumentMargin(0);
+    QTextOption opt = doc.defaultTextOption();
+    opt.setWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    doc.setDefaultTextOption(opt);
+}
+
+AttachmentGridLayout calculateAttachmentGrid(int count, int maxWidth)
+{
+    AttachmentGridLayout layout;
+
+    if (count <= 0) {
+        layout.totalHeight = 0;
+        return layout;
+    }
+
+    constexpr int MaxGridWidth = 400;
+    int gridWidth = std::min(maxWidth, MaxGridWidth);
+    constexpr int gap = 4;
+
+    if (count == 1) {
+        // placeholder. single images are shown in full
+        layout.cells.append({ 0, QRect(0, 0, gridWidth, 300) });
+        layout.totalHeight = 300;
+    } else if (count == 2) {
+        // 2 horizontal
+        int w = (gridWidth - gap) / 2;
+        layout.cells.append({ 0, QRect(0, 0, w, 300) });
+        layout.cells.append({ 1, QRect(w + gap, 0, w, 300) });
+        layout.totalHeight = 300;
+    } else if (count == 3) {
+        // 1 then 2 vertical
+        int leftW = (gridWidth * 2) / 3 - gap / 2;
+        int rightW = gridWidth / 3 - gap / 2;
+        int rightH = (300 - gap) / 2;
+        layout.cells.append({ 0, QRect(0, 0, leftW, 300) });
+        layout.cells.append({ 1, QRect(leftW + gap, 0, rightW, rightH) });
+        layout.cells.append({ 2, QRect(leftW + gap, rightH + gap, rightW, rightH) });
+        layout.totalHeight = 300;
+    } else if (count == 4) {
+        // 2x2
+        int w = (gridWidth - gap) / 2;
+        int h = 150;
+        layout.cells.append({ 0, QRect(0, 0, w, h) });
+        layout.cells.append({ 1, QRect(w + gap, 0, w, h) });
+        layout.cells.append({ 2, QRect(0, h + gap, w, h) });
+        layout.cells.append({ 3, QRect(w + gap, h + gap, w, h) });
+        layout.totalHeight = h * 2 + gap;
+    } else if (count == 5) {
+        // 2 on top, 3 on bottom
+        int topW = (gridWidth - gap) / 2;
+        int bottomW = (gridWidth - gap * 2) / 3;
+        int h = 150;
+        layout.cells.append({ 0, QRect(0, 0, topW, h) });
+        layout.cells.append({ 1, QRect(topW + gap, 0, topW, h) });
+        layout.cells.append({ 2, QRect(0, h + gap, bottomW, h) });
+        layout.cells.append({ 3, QRect(bottomW + gap, h + gap, bottomW, h) });
+        layout.cells.append({ 4, QRect((bottomW + gap) * 2, h + gap, bottomW, h) });
+        layout.totalHeight = h * 2 + gap;
+    } else if (count == 6) {
+        // 2x3
+        int w = (gridWidth - gap * 2) / 3;
+        int h = 150;
+        for (int row = 0; row < 2; ++row)
+            for (int col = 0; col < 3; ++col) {
+                int idx = row * 3 + col;
+                layout.cells.append({ idx, QRect(col * (w + gap), row * (h + gap), w, h) });
+            }
+        layout.totalHeight = h * 2 + gap;
+    } else if (count == 7) {
+        // 1 on top, 2x3 on bottom
+        int h = 133;
+        int w3 = (gridWidth - gap * 2) / 3;
+        layout.cells.append({ 0, QRect(0, 0, gridWidth, h) });
+        for (int row = 0; row < 2; ++row)
+            for (int col = 0; col < 3; ++col) {
+                int idx = 1 + row * 3 + col;
+                layout.cells.append({ idx, QRect(col * (w3 + gap), (row + 1) * (h + gap), w3, h) });
+            }
+        layout.totalHeight = h * 3 + gap * 2;
+    } else if (count == 8) {
+        // 2 on top, 2x3 on bottom
+        int h = 133;
+        int w2 = (gridWidth - gap) / 2;
+        int w3 = (gridWidth - gap * 2) / 3;
+        layout.cells.append({ 0, QRect(0, 0, w2, h) });
+        layout.cells.append({ 1, QRect(w2 + gap, 0, w2, h) });
+        for (int row = 0; row < 2; ++row)
+            for (int col = 0; col < 3; ++col) {
+                int idx = 2 + row * 3 + col;
+                layout.cells.append({ idx, QRect(col * (w3 + gap), (row + 1) * (h + gap), w3, h) });
+            }
+        layout.totalHeight = h * 3 + gap * 2;
+    } else if (count == 9) {
+        // 3x3
+        int w = (gridWidth - gap * 2) / 3;
+        int h = 133;
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col) {
+                int idx = row * 3 + col;
+                layout.cells.append({ idx, QRect(col * (w + gap), row * (h + gap), w, h) });
+            }
+        layout.totalHeight = h * 3 + gap * 2;
+    } else {
+        // 1 on top, 3x3 on bottom
+        int h = 133;
+        int w3 = (gridWidth - gap * 2) / 3;
+        layout.cells.append({ 0, QRect(0, 0, gridWidth, h) });
+        for (int row = 0; row < 3; ++row)
+            for (int col = 0; col < 3; ++col) {
+                int idx = 1 + row * 3 + col;
+                if (idx >= count)
+                    break;
+                layout.cells.append({ idx, QRect(col * (w3 + gap), (row + 1) * (h + gap), w3, h) });
+            }
+        layout.totalHeight = h * 4 + gap * 3;
+    }
+
+    return layout;
+}
+
+bool embedHasPlayableVideo(const EmbedData &embed)
+{
+    return embed.videoPlayable && embed.thumbnail.isNull() && embed.images.isEmpty();
+}
+
+bool embedHasVideoArea(const EmbedData &embed)
+{
+    return embed.thumbnail.isNull() &&
+           embed.images.isEmpty() &&
+           (embed.videoPlayable || !embed.videoThumbnail.isNull());
+}
+
+bool embedIsBareVideo(const EmbedData &embed)
+{
+    return embedHasPlayableVideo(embed) &&
+           embed.title.isEmpty() &&
+           embed.description.isEmpty() &&
+           embed.authorName.isEmpty() &&
+           embed.providerName.isEmpty() &&
+           embed.footerText.isEmpty() &&
+           embed.fields.isEmpty();
+}
+
+static QSize embedVideoDisplaySize(const EmbedData &embed)
+{
+    if (!embed.videoThumbnail.isNull())
+        return embed.videoThumbnail.size().scaled(embed.videoThumbnailSize, Qt::KeepAspectRatio);
+    return embed.videoThumbnailSize.isValid() ? embed.videoThumbnailSize : QSize();
+}
+
+EmbedLayout calculateEmbedLayout(const EmbedData &embed, const QFont &font, int maxWidth, int left,
+                                 int top, const ChatModel *model, Core::Snowflake messageId,
+                                 int embedIndex)
+{
+    EmbedLayout layout = {};
+
+    int embedWidth = std::min(maxWidth, embedMaxWidth());
+    int contentWidth = embedWidth - embedBorderWidth() - embedPadding() * 2;
+    int contentLeft = left + embedBorderWidth() + embedPadding();
+
+    if (embedIsBareVideo(embed)) {
+        layout.hasThumbnail = false;
+        layout.contentWidth = contentWidth;
+
+        const QSize size = embedVideoDisplaySize(embed);
+        layout.imagesRect = QRect(left, top, size.width(), size.height());
+        layout.totalHeight = size.height();
+        layout.embedRect = QRect(left, top, embedWidth, layout.totalHeight);
+        layout.contentRect = layout.imagesRect;
+
+        return layout;
+    }
+
+    if (embed.type == EmbedType::Gifv) {
+        layout.hasThumbnail = false;
+        layout.contentWidth = contentWidth;
+        int currentY = 0;
+
+        int imagesHeight = 0;
+        if (!embed.thumbnail.isNull()) {
+            QSize actualSize =
+                    embed.thumbnail.size().scaled(embed.thumbnailSize, Qt::KeepAspectRatio);
+            imagesHeight = actualSize.height();
+            layout.imagesRect =
+                    QRect(left, top + currentY, actualSize.width(), actualSize.height());
+            currentY += imagesHeight;
+        }
+
+        QFont gifFont = font;
+        gifFont.setPointSize(gifFont.pointSize() - 2);
+        QFontMetrics gifFm(gifFont);
+        int gifLabelHeight = gifFm.height() + 4;
+        currentY += gifLabelHeight;
+
+        layout.totalHeight = currentY;
+        layout.embedRect = QRect(left, top, embedWidth, layout.totalHeight);
+        layout.contentRect = QRect(contentLeft, top, contentWidth, layout.totalHeight);
+
+        return layout;
+    }
+
+    if (embed.type == EmbedType::Image) {
+        layout.hasThumbnail = false;
+        layout.contentWidth = contentWidth;
+        int currentY = 0;
+
+        if (!embed.thumbnail.isNull()) {
+            QSize actualSize =
+                    embed.thumbnail.size().scaled(embed.thumbnailSize, Qt::KeepAspectRatio);
+            layout.imagesRect =
+                    QRect(left, top + currentY, actualSize.width(), actualSize.height());
+            currentY += actualSize.height();
+        }
+
+        layout.totalHeight = currentY;
+        layout.embedRect = QRect(left, top, embedWidth, layout.totalHeight);
+        layout.contentRect = QRect(contentLeft, top, contentWidth, layout.totalHeight);
+
+        return layout;
+    }
+
+    layout.hasThumbnail =
+            !embed.thumbnail.isNull() || (!embed.videoThumbnail.isNull() && embed.images.isEmpty());
+    if (layout.hasThumbnail)
+        contentWidth -= (thumbnailSize() + embedPadding());
+
+    layout.contentWidth = contentWidth;
+
+    int contentTop = top + embedPadding();
+    int currentY = 0;
+
+    if (!embed.providerName.isEmpty()) {
+        QFont providerFont = font;
+        providerFont.setPointSize(providerFont.pointSize() - 2);
+        QFontMetrics providerFm(providerFont);
+        int providerHeight = providerFm.height() + 4;
+        layout.providerRect =
+                QRect(contentLeft, contentTop + currentY, contentWidth, providerHeight);
+        currentY += providerHeight;
+    }
+
+    if (!embed.authorName.isEmpty()) {
+        QFont authorFont = font;
+        authorFont.setPointSize(authorFont.pointSize() - 1);
+        authorFont.setBold(true);
+        QFontMetrics authorFm(authorFont);
+        int authorHeight = std::max(authorIconSize(), authorFm.height()) + 4;
+        layout.authorRect = QRect(contentLeft, contentTop + currentY, contentWidth, authorHeight);
+        currentY += authorHeight;
+    }
+
+    if (!embed.title.isEmpty()) {
+        QFont titleFont = font;
+        titleFont.setBold(true);
+        QString titleHtml = !embed.titleParsed.isEmpty() ? embed.titleParsed : embed.title;
+        int titleHeight;
+        QTextDocument *cached = model ? model->getCachedDocument(embedTitleDocKey(messageId, embedIndex))
+                                      : nullptr;
+        if (cached) {
+            if (int(cached->textWidth()) != contentWidth)
+                cached->setTextWidth(contentWidth);
+            titleHeight = int(std::ceil(cached->size().height())) + 4;
+        } else {
+            QTextDocument titleDoc;
+            titleDoc.setDefaultFont(titleFont);
+            titleDoc.setTextWidth(contentWidth);
+            titleDoc.setHtml(titleHtml);
+            titleHeight = int(std::ceil(titleDoc.size().height())) + 4;
+        }
+        layout.titleRect = QRect(contentLeft, contentTop + currentY, contentWidth, titleHeight);
+        currentY += titleHeight;
+    }
+
+    if (!embed.description.isEmpty()) {
+        QString descHtml = !embed.descriptionParsed.isEmpty() ? embed.descriptionParsed : embed.description;
+        int descriptionHeight;
+        QTextDocument *cached = model ? model->getCachedDocument(embedDescDocKey(messageId, embedIndex))
+                                      : nullptr;
+        if (cached) {
+            if (int(cached->textWidth()) != contentWidth)
+                cached->setTextWidth(contentWidth);
+            descriptionHeight = int(std::ceil(cached->size().height())) + 8;
+        } else {
+            QTextDocument descDoc;
+            descDoc.setDefaultFont(font);
+            descDoc.setTextWidth(contentWidth);
+            descDoc.setHtml(descHtml);
+            descriptionHeight = int(std::ceil(descDoc.size().height())) + 8;
+        }
+        layout.descriptionRect =
+                QRect(contentLeft, contentTop + currentY, contentWidth, descriptionHeight);
+        currentY += descriptionHeight;
+    }
+
+    if (!embed.fields.isEmpty()) {
+        QFont fieldNameFont = font;
+        fieldNameFont.setBold(true);
+        QFontMetrics fieldNameFm(fieldNameFont);
+        int fieldWidth = (contentWidth - 2 * fieldSpacing()) / 3;
+
+        int fieldsStartY = currentY;
+        int fieldX = 0;
+        int fieldsInRow = 0;
+        int rowStartY = currentY;
+        int maxRowHeight = 0;
+
+        for (int i = 0; i < embed.fields.size(); ++i) {
+            const auto &field = embed.fields[i];
+            int fldTextWidth = field.isInline ? fieldWidth : contentWidth;
+
+            QString nameHtml = !field.nameParsed.isEmpty() ? field.nameParsed : field.name;
+            int nameHeight;
+            QTextDocument *cachedName = model
+                                                ? model->getCachedDocument(embedFieldNameDocKey(messageId, embedIndex, i))
+                                                : nullptr;
+            if (cachedName) {
+                if (int(cachedName->textWidth()) != fldTextWidth)
+                    cachedName->setTextWidth(fldTextWidth);
+                nameHeight = int(std::ceil(cachedName->size().height()));
+            } else {
+                QTextDocument nameDoc;
+                nameDoc.setDefaultFont(fieldNameFont);
+                nameDoc.setTextWidth(fldTextWidth);
+                nameDoc.setHtml(nameHtml);
+                nameHeight = int(std::ceil(nameDoc.size().height()));
+            }
+
+            QString valueHtml = !field.valueParsed.isEmpty() ? field.valueParsed : field.value;
+            int valueHeight;
+            QTextDocument *cachedValue = model ? model->getCachedDocument(embedFieldValueDocKey(messageId, embedIndex, i))
+                                               : nullptr;
+            if (cachedValue) {
+                if (int(cachedValue->textWidth()) != fldTextWidth)
+                    cachedValue->setTextWidth(fldTextWidth);
+                valueHeight = int(std::ceil(cachedValue->size().height()));
+            } else {
+                QTextDocument valueDoc;
+                valueDoc.setDefaultFont(font);
+                valueDoc.setTextWidth(fldTextWidth);
+                valueDoc.setHtml(valueHtml);
+                valueHeight = int(std::ceil(valueDoc.size().height()));
+            }
+            int fieldHeight = nameHeight + 2 + valueHeight;
+
+            EmbedFieldLayout fieldLayout;
+            fieldLayout.fieldIndex = i;
+
+            if (!field.isInline) {
+                if (fieldsInRow > 0) {
+                    currentY = rowStartY + maxRowHeight + fieldSpacing();
+                    fieldX = 0;
+                    fieldsInRow = 0;
+                    maxRowHeight = 0;
+                    rowStartY = currentY;
+                }
+
+                fieldLayout.nameRect =
+                        QRect(contentLeft, contentTop + currentY, contentWidth, nameHeight);
+                fieldLayout.valueRect = QRect(contentLeft, contentTop + currentY + nameHeight + 2,
+                                              contentWidth, valueHeight);
+                layout.fieldLayouts.append(fieldLayout);
+
+                currentY += fieldHeight + fieldSpacing();
+                rowStartY = currentY;
+            } else {
+                if (fieldsInRow >= 3) {
+                    currentY = rowStartY + maxRowHeight + fieldSpacing();
+                    fieldX = 0;
+                    fieldsInRow = 0;
+                    maxRowHeight = 0;
+                    rowStartY = currentY;
+                }
+
+                int xPos = contentLeft + fieldX;
+                fieldLayout.nameRect = QRect(xPos, contentTop + currentY, fieldWidth, nameHeight);
+                fieldLayout.valueRect = QRect(xPos, contentTop + currentY + nameHeight + 2,
+                                              fieldWidth, valueHeight);
+                layout.fieldLayouts.append(fieldLayout);
+
+                maxRowHeight = std::max(maxRowHeight, fieldHeight);
+                fieldX += fieldWidth + fieldSpacing();
+                fieldsInRow++;
+            }
+        }
+
+        if (fieldsInRow > 0)
+            currentY = rowStartY + maxRowHeight + fieldSpacing();
+    }
+
+    if (!embed.images.isEmpty()) {
+        int imagesTop = contentTop + currentY;
+
+        if (embed.images.size() == 1) {
+            const auto &img = embed.images[0];
+            if (!img.pixmap.isNull()) {
+                QSize actualSize = img.pixmap.size().scaled(img.displaySize, Qt::KeepAspectRatio);
+                layout.imagesRect =
+                        QRect(contentLeft, imagesTop, actualSize.width(), actualSize.height());
+                layout.imageLayouts.append({ 0, layout.imagesRect });
+                currentY += actualSize.height();
+            }
+        } else {
+            AttachmentGridLayout grid = calculateAttachmentGrid(embed.images.size(), contentWidth);
+            layout.imagesRect = QRect(contentLeft, imagesTop, contentWidth, grid.totalHeight);
+            for (const auto &cell : grid.cells) {
+                QRect imgRect = cell.rect.translated(contentLeft, imagesTop);
+                layout.imageLayouts.append({ cell.attachmentIndex, imgRect });
+            }
+            currentY += grid.totalHeight;
+        }
+    } else if (embedHasVideoArea(embed)) {
+        int imagesTop = contentTop + currentY;
+        const QSize actualSize = embedVideoDisplaySize(embed);
+        layout.imagesRect = QRect(contentLeft, imagesTop, actualSize.width(), actualSize.height());
+        currentY += actualSize.height();
+    }
+
+    if (!embed.footerText.isEmpty()) {
+        QFont footerFont = font;
+        footerFont.setPointSize(footerFont.pointSize() - 2);
+        QFontMetrics footerFm(footerFont);
+        int footerHeight = std::max(footerIconSize(), footerFm.height()) + 4;
+        layout.footerRect = QRect(contentLeft, contentTop + currentY, contentWidth, footerHeight);
+        currentY += footerHeight;
+    }
+
+    int totalContentHeight = embedPadding() + currentY;
+    if (layout.hasThumbnail) {
+        int thumbTop = contentTop;
+        int thumbX = contentLeft + contentWidth + embedPadding();
+        QSize thumbSize =
+                !embed.thumbnail.isNull() ? embed.thumbnailSize : embed.videoThumbnailSize;
+        layout.thumbnailRect = QRect(thumbX, thumbTop, thumbSize.width(), thumbSize.height());
+        totalContentHeight = std::max(totalContentHeight, embedPadding() * 2 + thumbnailSize());
+    }
+
+    layout.totalHeight = totalContentHeight;
+    layout.embedRect = QRect(left, top, embedWidth, layout.totalHeight);
+    layout.contentRect = QRect(contentLeft, contentTop, contentWidth, currentY);
+
+    return layout;
+}
+
+int attachmentBoxHeight(const AttachmentData &att)
+{
+    if (att.isAudio)
+        return att.isVoiceMessage ? VideoControls::barHeight()
+                                  : fileAttachmentHeight() + VideoControls::barHeight();
+    return fileAttachmentHeight();
+}
+
+QRect audioBarRect(const QRect &attachmentBox, bool voiceMessage)
+{
+    if (voiceMessage)
+        return attachmentBox;
+    return QRect(attachmentBox.left(),
+                 attachmentBox.bottom() - VideoControls::barHeight() + 1,
+                 attachmentBox.width(),
+                 VideoControls::barHeight());
+}
+
+int calculateAttachmentsHeight(const QList<AttachmentData> &attachments, int textWidth)
+{
+    if (attachments.isEmpty())
+        return 0;
+
+    int imageCount = 0;
+    int filesHeight = 0;
+    QSize firstImageSize;
+
+    for (const auto &att : attachments) {
+        if (att.isMedia()) {
+            if (imageCount == 0)
+                firstImageSize = att.displaySize;
+            imageCount++;
+        } else {
+            filesHeight += attachmentBoxHeight(att) + padding();
+        }
+    }
+
+    int totalHeight = 0;
+
+    if (imageCount == 1) {
+        totalHeight += firstImageSize.height() + padding();
+    } else if (imageCount > 1) {
+        AttachmentGridLayout grid = calculateAttachmentGrid(imageCount, textWidth);
+        totalHeight += grid.totalHeight + padding();
+    }
+
+    totalHeight += filesHeight;
+
+    return totalHeight;
+}
+
+int calculateEmbedsHeight(const QList<EmbedData> &embeds, const QFont &font, int textWidth)
+{
+    if (embeds.isEmpty())
+        return 0;
+
+    int totalHeight = 0;
+    for (const auto &embed : embeds) {
+        EmbedLayout layout = calculateEmbedLayout(embed, font, textWidth, 0, 0);
+        totalHeight += layout.totalHeight + padding();
+    }
+    return totalHeight;
+}
+
+const char *systemMessageIcon(Discord::MessageType type)
+{
+    using Discord::MessageType;
+    using namespace Core::Theme::Icons::Name;
+
+    switch (type) {
+    case MessageType::RECIPIENT_ADD:
+    case MessageType::USER_JOIN:
+        return ArrowRight;
+    case MessageType::RECIPIENT_REMOVE:
+        return ArrowLeft;
+    case MessageType::CALL:
+    case MessageType::VOICE_HANGOUT_INVITE:
+        return Phone;
+    case MessageType::CHANNEL_NAME_CHANGE:
+    case MessageType::CHAT_WALLPAPER_SET:
+    case MessageType::CHAT_WALLPAPER_REMOVE:
+        return Pencil;
+    case MessageType::CHANNEL_ICON_CHANGE:
+        return Image;
+    case MessageType::CHANNEL_PINNED_MESSAGE:
+        return Pin;
+    case MessageType::PREMIUM_GUILD_SUBSCRIPTION:
+    case MessageType::PREMIUM_GUILD_SUBSCRIPTION_TIER_1:
+    case MessageType::PREMIUM_GUILD_SUBSCRIPTION_TIER_2:
+    case MessageType::PREMIUM_GUILD_SUBSCRIPTION_TIER_3:
+    case MessageType::ROLE_SUBSCRIPTION_PURCHASE:
+    case MessageType::INTERACTION_PREMIUM_UPSELL:
+    case MessageType::GUILD_APPLICATION_PREMIUM_SUBSCRIPTION:
+    case MessageType::PREMIUM_REFERRAL:
+    case MessageType::CUSTOM_GIFT:
+    case MessageType::PURCHASE_NOTIFICATION:
+    case MessageType::NITRO_NOTIFICATION:
+    case MessageType::GIFTING_PROMPT:
+    case MessageType::HD_STREAMING_UPGRADED:
+        return Gem;
+    case MessageType::CHANNEL_FOLLOW_ADD:
+        return Rss;
+    case MessageType::GUILD_STREAM:
+    case MessageType::STAGE_START:
+    case MessageType::STAGE_END:
+    case MessageType::STAGE_SPEAKER:
+    case MessageType::STAGE_TOPIC:
+        return Radio;
+    case MessageType::STAGE_RAISE_HAND:
+        return Hand;
+    case MessageType::GUILD_DISCOVERY_DISQUALIFIED:
+    case MessageType::GUILD_DISCOVERY_REQUALIFIED:
+    case MessageType::GUILD_DISCOVERY_GRACE_PERIOD_INITIAL_WARNING:
+    case MessageType::GUILD_DISCOVERY_GRACE_PERIOD_FINAL_WARNING:
+        return Compass;
+    case MessageType::THREAD_CREATED:
+    case MessageType::THREAD_STARTER_MESSAGE:
+        return Spool;
+    case MessageType::GUILD_INVITE_REMINDER:
+    case MessageType::GUILD_DEADCHAT_REVIVE_PROMPT:
+    case MessageType::GUILD_GAMING_STATS_PROMPT:
+    case MessageType::CHANGELOG:
+    case MessageType::IN_GAME_MESSAGE_NUX:
+        return Bell;
+    case MessageType::AUTO_MODERATION_ACTION:
+    case MessageType::GUILD_INCIDENT_ALERT_MODE_ENABLED:
+    case MessageType::GUILD_INCIDENT_ALERT_MODE_DISABLED:
+    case MessageType::GUILD_INCIDENT_REPORT_RAID:
+    case MessageType::GUILD_INCIDENT_REPORT_FALSE_ALARM:
+    case MessageType::REPORT_TO_MOD_DELETED_MESSAGE:
+    case MessageType::REPORT_TO_MOD_TIMEOUT_USER:
+        return ShieldAlert;
+    case MessageType::PRIVATE_CHANNEL_INTEGRATION_ADDED:
+    case MessageType::PRIVATE_CHANNEL_INTEGRATION_REMOVED:
+    case MessageType::CHANNEL_LINKED_TO_LOBBY:
+        return Bot;
+    case MessageType::POLL:
+    case MessageType::POLL_RESULT:
+        return ChartColumn;
+    case MessageType::GUILD_JOIN_REQUEST_ACCEPT_NOTIFICATION:
+        return UserPlus;
+    case MessageType::GUILD_JOIN_REQUEST_REJECT_NOTIFICATION:
+    case MessageType::GUILD_JOIN_REQUEST_WITHDRAWN_NOTIFICATION:
+        return UserMinus;
+    default:
+        return MessageCircle;
+    }
+}
+
+MessageLayout calculateMessageLayout(const LayoutContext &ctx)
+{
+    MessageLayout layout = {};
+
+    QFontMetrics fm(ctx.font);
+
+    QRect rowRect(0, ctx.rowTop, ctx.rowWidth, 10000);
+
+    layout.showHeader = ctx.showHeader;
+    layout.hasSeparator = ctx.hasSeparator;
+    layout.hasReply = ctx.replyData.state != ReplyData::State::None;
+
+    layout.separatorRect = ctx.hasSeparator ? dateSeparatorRectForRow(rowRect) : QRect();
+
+    int replyOffset = 0;
+    if (layout.hasReply) {
+        int replyTop = ctx.rowTop + padding() + (ctx.hasSeparator ? separatorHeight() : 0);
+        int replyLeft = padding() + avatarSize() + padding();
+        int replyWidth = ctx.rowWidth - replyLeft - padding();
+        layout.replyRect = QRect(replyLeft, replyTop, replyWidth, replyBarHeight());
+        replyOffset = padding() + replyBarHeight();
+
+        bool canJumpToReferenced = ctx.replyData.referencedMessageId.isValid() &&
+                                   ctx.replyData.state != ReplyData::State::Deleted;
+        if (canJumpToReferenced)
+            layout.hitRegions.append({ HitRegion::Kind::ReplyBar, layout.replyRect, -1, -1, {} });
+    }
+
+    int textLeft = padding() + avatarSize() + padding();
+    int textWidth = ctx.rowWidth - textLeft - padding();
+    if (textWidth < 10)
+        textWidth = 10;
+
+    int separatorOffset = ctx.hasSeparator ? separatorHeight() : 0;
+    int headerAreaTop = ctx.rowTop + separatorOffset + replyOffset;
+
+    int capDrop = fm.ascent() - fm.capHeight();
+    if (layout.hasReply) {
+        // Reply messages: no extra top padding, reply bar provides the visual gap
+        layout.avatarRect = QRect(padding(), headerAreaTop, avatarSize(), avatarSize());
+        layout.headerRect = QRect(textLeft, headerAreaTop - capDrop, textWidth, fm.height());
+    } else {
+        int avatarTop = ctx.rowTop + blockTopPadding() + separatorOffset;
+        layout.avatarRect = QRect(padding(), avatarTop, avatarSize(), avatarSize());
+        layout.headerRect = QRect(textLeft, avatarTop - capDrop, textWidth, fm.height());
+    }
+
+    if (layout.showHeader) {
+        layout.hitRegions.append({ HitRegion::Kind::Avatar, layout.avatarRect, -1, -1, {} });
+        layout.hitRegions.append({ HitRegion::Kind::UsernameHeader, layout.headerRect, -1, -1, {} });
+    }
+
+    if (!ctx.htmlContent.isEmpty()) {
+        QTextDocument *cached = ctx.model ? ctx.model->getCachedDocument(bodyDocKey(ctx.messageId))
+                                          : nullptr;
+        if (cached) {
+            if (int(cached->textWidth()) != textWidth)
+                cached->setTextWidth(textWidth);
+            layout.textHeight = int(std::ceil(cached->size().height()));
+        } else {
+            QFont docFont = ctx.font;
+            if (ctx.isSystemMessage)
+                docFont.setItalic(true);
+            QTextDocument doc;
+            setupDocument(doc, ctx.htmlContent, docFont, textWidth);
+            layout.textHeight = int(std::ceil(doc.size().height()));
+        }
+    }
+
+    int textTop;
+    if (layout.hasReply) {
+        textTop = headerAreaTop - capDrop;
+        if (ctx.showHeader)
+            textTop += fm.height();
+    } else {
+        textTop = ctx.rowTop + separatorOffset;
+        if (ctx.showHeader)
+            textTop += blockTopPadding() - capDrop + fm.height();
+        else
+            textTop += 0;
+    }
+
+    layout.textRect = QRect(textLeft, textTop, textWidth, layout.textHeight);
+
+    if (ctx.isSystemMessage) {
+        layout.systemIconRect = QRect(0, 0, systemIconSize(), systemIconSize());
+        layout.systemIconRect.moveCenter(QPoint(padding() + avatarSize() / 2, textTop + fm.height() / 2));
+    }
+
+    int totalHeight = 0;
+    if (layout.hasReply) {
+        totalHeight = padding() + replyBarHeight() - capDrop + fm.height() + layout.textHeight + padding() / 2;
+    } else if (ctx.showHeader) {
+        int contentHeight = blockTopPadding() - capDrop + fm.height() + layout.textHeight + padding() / 2;
+        totalHeight = contentHeight;
+    } else {
+        totalHeight = layout.textHeight + padding() / 2;
+    }
+
+    if (ctx.hasSeparator)
+        totalHeight += separatorHeight();
+
+    layout.attachmentsTop = textTop + layout.textHeight;
+    layout.attachmentsTotalHeight = 0;
+
+    if (!ctx.attachments.isEmpty()) {
+        int imageIndex = 0;
+        int fileIndex = 0;
+
+        QList<AttachmentData> images;
+        for (int i = 0; i < ctx.attachments.size(); ++i) {
+            if (ctx.attachments[i].isMedia())
+                images.append(ctx.attachments[i]);
+        }
+
+        if (!images.isEmpty()) {
+            layout.imageGrid = calculateAttachmentGrid(images.size(), textWidth);
+
+            for (int i = 0; i < ctx.attachments.size(); ++i) {
+                if (ctx.attachments[i].isMedia()) {
+                    AttachmentLayout attLayout;
+                    attLayout.index = i;
+
+                    if (images.size() == 1) {
+                        attLayout.rect = QRect(textLeft, layout.attachmentsTop,
+                                               images[0].displaySize.width(),
+                                               images[0].displaySize.height());
+                    } else if (imageIndex < layout.imageGrid.cells.size()) {
+                        attLayout.rect = layout.imageGrid.cells[imageIndex].rect.translated(
+                                textLeft, layout.attachmentsTop);
+                    }
+                    layout.imageLayouts.append(attLayout);
+                    imageIndex++;
+                }
+            }
+
+            if (images.size() == 1)
+                layout.attachmentsTotalHeight += images[0].displaySize.height();
+            else
+                layout.attachmentsTotalHeight += layout.imageGrid.totalHeight;
+        }
+
+        int currentFileTop = layout.attachmentsTop + layout.attachmentsTotalHeight;
+        int fileWidth = std::min(textWidth, maxAttachmentWidth());
+
+        for (int i = 0; i < ctx.attachments.size(); ++i) {
+            if (!ctx.attachments[i].isMedia()) {
+                const auto &att = ctx.attachments[i];
+                const int boxHeight = attachmentBoxHeight(att);
+                const int boxWidth = att.isVoiceMessage ? std::min(fileWidth, voiceMessageWidth())
+                                                        : fileWidth;
+
+                AttachmentLayout attLayout;
+                attLayout.index = i;
+                attLayout.rect = QRect(textLeft, currentFileTop, boxWidth, boxHeight);
+                layout.fileLayouts.append(attLayout);
+                currentFileTop += boxHeight + padding();
+                layout.attachmentsTotalHeight += boxHeight + padding();
+                fileIndex++;
+            }
+        }
+
+        totalHeight += layout.attachmentsTotalHeight;
+    }
+
+    layout.embedsTop = layout.attachmentsTop + layout.attachmentsTotalHeight;
+    layout.embedsTotalHeight = 0;
+
+    if (!ctx.embeds.isEmpty()) {
+        int embedTop = layout.embedsTop;
+        for (int ei = 0; ei < ctx.embeds.size(); ++ei) {
+            const auto &embed = ctx.embeds[ei];
+            EmbedLayout embedLayout = calculateEmbedLayout(embed, ctx.font, textWidth, textLeft,
+                                                           embedTop, ctx.model, ctx.messageId, ei);
+            layout.embedLayouts.append(embedLayout);
+            embedTop += embedLayout.totalHeight + padding();
+            layout.embedsTotalHeight += embedLayout.totalHeight + padding();
+        }
+        totalHeight += layout.embedsTotalHeight;
+    }
+
+    int forwardOriginHeight = 0;
+    if (!ctx.forwardOrigin.text.isEmpty()) {
+        QFontMetrics originFm(forwardOriginFont(ctx.font));
+        int iconSpace = ctx.forwardOrigin.iconUrl.isValid()
+                                ? forwardOriginIconSize() + forwardOriginIconGap()
+                                : 0;
+        int originWidth = std::min(iconSpace + originFm.horizontalAdvance(ctx.forwardOrigin.text),
+                                   textWidth);
+        int originRowHeight = std::max(originFm.height(),
+                                       iconSpace > 0 ? forwardOriginIconSize() : 0);
+        layout.forwardOriginRect = QRect(textLeft, layout.embedsTop + layout.embedsTotalHeight,
+                                         originWidth, originRowHeight);
+        forwardOriginHeight = originRowHeight + padding() / 2;
+        totalHeight += forwardOriginHeight;
+        layout.hitRegions.append(
+                { HitRegion::Kind::ForwardOrigin, layout.forwardOriginRect, -1, -1,
+                  QStringLiteral("acheron://channel/%1")
+                          .arg(QString::number(static_cast<quint64>(ctx.forwardOrigin.channelId))) });
+    }
+
+    layout.reactionsTop = layout.embedsTop + layout.embedsTotalHeight + forwardOriginHeight;
+    layout.reactionsTotalHeight = 0;
+
+    if (!ctx.reactions.isEmpty()) {
+        QFontMetrics reactionFm(ctx.font);
+        int currentX = textLeft;
+        int currentY = layout.reactionsTop + reactionTopMargin();
+        int rowHeight = reactionPillHeight();
+        int maxX = textLeft + textWidth;
+
+        for (int i = 0; i < ctx.reactions.size(); ++i) {
+            const auto &reaction = ctx.reactions[i];
+
+            int countTextWidth = reactionFm.horizontalAdvance(QString::number(reaction.count));
+            int pillWidth = reactionPillPadding() + reactionEmojiSize() + 4 + countTextWidth + reactionPillPadding();
+
+            // wrap to next row if needed
+            if (currentX + pillWidth > maxX && currentX > textLeft) {
+                currentX = textLeft;
+                currentY += rowHeight + reactionRowSpacing();
+            }
+
+            QRect pillRect(currentX, currentY, pillWidth, rowHeight);
+            QRect emojiRect(currentX + reactionPillPadding(),
+                            currentY + (rowHeight - reactionEmojiSize()) / 2,
+                            reactionEmojiSize(), reactionEmojiSize());
+            QRect countRect(emojiRect.right() + 4,
+                            currentY,
+                            countTextWidth,
+                            rowHeight);
+
+            ReactionLayout rl;
+            rl.reactionIndex = i;
+            rl.pillRect = pillRect;
+            rl.emojiRect = emojiRect;
+            rl.countRect = countRect;
+            layout.reactionLayouts.append(rl);
+
+            currentX += pillWidth + reactionSpacing();
+        }
+
+        layout.reactionsTotalHeight = reactionTopMargin() + (currentY - layout.reactionsTop - reactionTopMargin()) + rowHeight;
+        totalHeight += layout.reactionsTotalHeight;
+    }
+
+    // last ditch minimum size but only with headers
+    if (ctx.showHeader) {
+        int minHeight = padding() + avatarSize() + padding();
+        if (totalHeight < minHeight)
+            totalHeight = minHeight;
+    }
+
+    layout.totalHeight = totalHeight;
+    layout.rowRect = QRect(0, ctx.rowTop, ctx.rowWidth, totalHeight);
+
+    for (int ei = 0; ei < layout.embedLayouts.size(); ++ei) {
+        const auto &el = layout.embedLayouts[ei];
+        if (ei >= ctx.embeds.size())
+            continue;
+        const auto &embed = ctx.embeds[ei];
+
+        if (el.hasThumbnail && !el.thumbnailRect.isNull())
+            layout.hitRegions.append({ HitRegion::Kind::EmbedThumbnail, el.thumbnailRect, ei, -1, embed.thumbnailUrl.toString() });
+
+        if (!embed.authorName.isEmpty() && !el.authorRect.isNull() && !embed.authorUrl.isEmpty())
+            layout.hitRegions.append({ HitRegion::Kind::EmbedAuthor, el.authorRect, ei, -1, embed.authorUrl });
+
+        if (!embed.title.isEmpty() && !el.titleRect.isNull())
+            layout.hitRegions.append({ HitRegion::Kind::EmbedTitle, el.titleRect, ei, -1, embed.url });
+
+        for (const auto &imgLayout : el.imageLayouts) {
+            if (imgLayout.imageIndex >= embed.images.size())
+                continue;
+            layout.hitRegions.append({ HitRegion::Kind::EmbedImage, imgLayout.rect, ei, imgLayout.imageIndex, embed.images[imgLayout.imageIndex].url.toString() });
+        }
+
+        if (embedHasVideoArea(embed) && !el.imagesRect.isNull())
+            layout.hitRegions.append({ HitRegion::Kind::EmbedVideoThumbnail, el.imagesRect, ei, -1, embed.url });
+
+        if (!embed.description.isEmpty() && !el.descriptionRect.isNull())
+            layout.hitRegions.append({ HitRegion::Kind::EmbedDescription, el.descriptionRect, ei, -1, {} });
+
+        for (const auto &fl : el.fieldLayouts) {
+            if (fl.fieldIndex >= embed.fields.size())
+                continue;
+            const auto &field = embed.fields[fl.fieldIndex];
+            if (!field.nameParsed.isEmpty() && !fl.nameRect.isNull())
+                layout.hitRegions.append({ HitRegion::Kind::EmbedFieldName, fl.nameRect, ei, fl.fieldIndex, {} });
+            if (!field.valueParsed.isEmpty() && !fl.valueRect.isNull())
+                layout.hitRegions.append({ HitRegion::Kind::EmbedFieldValue, fl.valueRect, ei, fl.fieldIndex, {} });
+        }
+    }
+
+    for (const auto &al : layout.imageLayouts) {
+        const auto kind = ctx.attachments[al.index].isVideo ? HitRegion::Kind::AttachmentVideo
+                                                            : HitRegion::Kind::AttachmentImage;
+        layout.hitRegions.append({ kind, al.rect, al.index, -1, {} });
+    }
+    for (const auto &al : layout.fileLayouts) {
+        const AttachmentData &att = ctx.attachments[al.index];
+        if (!att.isAudio) {
+            layout.hitRegions.append({ HitRegion::Kind::AttachmentFile, al.rect, al.index, -1, {} });
+            continue;
+        }
+
+        const QRect barRect = audioBarRect(al.rect, att.isVoiceMessage);
+        if (barRect.top() > al.rect.top()) {
+            QRect headerRect = al.rect;
+            headerRect.setBottom(barRect.top() - 1);
+            layout.hitRegions.append({ HitRegion::Kind::AttachmentFile, headerRect, al.index, -1, {} });
+        }
+        layout.hitRegions.append({ HitRegion::Kind::AttachmentAudio, barRect, al.index, -1, {} });
+    }
+
+    for (const auto &rl : layout.reactionLayouts)
+        layout.hitRegions.append({ HitRegion::Kind::Reaction, rl.pillRect, rl.reactionIndex, -1, {} });
+
+    return layout;
+}
+
+QString formatFileSize(qint64 bytes)
+{
+    if (bytes < 0)
+        return "0 B";
+
+    constexpr qint64 KB = 1024;
+    constexpr qint64 MB = KB * 1024;
+    constexpr qint64 GB = MB * 1024;
+
+    if (bytes >= GB)
+        return QString::number(bytes / double(GB), 'f', 2) + " GB";
+    if (bytes >= MB)
+        return QString::number(bytes / double(MB), 'f', 2) + " MB";
+    if (bytes >= KB)
+        return QString::number(bytes / double(KB), 'f', 2) + " KB";
+    return QString::number(bytes) + " B";
+}
+
+void drawCroppedPixmap(QPainter *painter, const QRect &targetRect, const QPixmap &pixmap)
+{
+    if (pixmap.isNull())
+        return;
+
+    QSize pixSize = pixmap.size() / pixmap.devicePixelRatio();
+    QRect sourceRect;
+
+    qreal targetAspect = qreal(targetRect.width()) / targetRect.height();
+    qreal pixAspect = qreal(pixSize.width()) / pixSize.height();
+
+    if (pixAspect > targetAspect) {
+        int cropWidth = qRound(pixSize.height() * targetAspect);
+        int cropX = (pixSize.width() - cropWidth) / 2;
+        sourceRect = QRect(cropX, 0, cropWidth, pixSize.height());
+    } else {
+        int cropHeight = qRound(pixSize.width() / targetAspect);
+        int cropY = (pixSize.height() - cropHeight) / 2;
+        sourceRect = QRect(0, cropY, pixSize.width(), cropHeight);
+    }
+
+    qreal dpr = pixmap.devicePixelRatio();
+    QRect physicalSourceRect(qRound(sourceRect.x() * dpr), qRound(sourceRect.y() * dpr),
+                             qRound(sourceRect.width() * dpr), qRound(sourceRect.height() * dpr));
+
+    painter->drawPixmap(targetRect, pixmap, physicalSourceRect);
+}
+
+static QString resolveEmbedAnchor(const ChatModel *model, const DocCacheKey &key,
+                                  const QString &parsedHtml, const QFont &font,
+                                  const QRect &rect, const QPoint &mousePos)
+{
+    if (parsedHtml.isEmpty() || !model)
+        return {};
+    QTextDocument *doc = model->getCachedDocument(key);
+    QTextDocument localDoc;
+    if (!doc) {
+        localDoc.setDefaultFont(font);
+        localDoc.setTextWidth(rect.width());
+        localDoc.setHtml(parsedHtml);
+        doc = &localDoc;
+    }
+    QPointF localPos = mousePos - rect.topLeft();
+    return doc->documentLayout()->anchorAt(localPos);
+}
+
+std::optional<HitRegion> hitTest(const ResolvedLayout &resolved, const QPoint &mousePos)
+{
+    const auto &layout = resolved.layout;
+    const auto &ctx = resolved.ctx;
+
+    for (const auto &region : layout.hitRegions) {
+        if (!region.rect.contains(mousePos))
+            continue;
+
+        switch (region.kind) {
+        case HitRegion::Kind::EmbedTitle: {
+            if (region.index >= 0 && region.index < ctx.embeds.size()) {
+                const auto &embed = ctx.embeds[region.index];
+                QFont titleFont = ctx.font;
+                titleFont.setBold(true);
+                QString link = resolveEmbedAnchor(ctx.model,
+                                                  embedTitleDocKey(ctx.messageId, region.index),
+                                                  embed.titleParsed, titleFont, region.rect, mousePos);
+                if (!link.isEmpty())
+                    return HitRegion{ HitRegion::Kind::EmbedLink, region.rect, region.index, -1, link };
+            }
+
+            if (region.url.isEmpty())
+                continue;
+            return region;
+        }
+        case HitRegion::Kind::EmbedDescription: {
+            if (region.index >= 0 && region.index < ctx.embeds.size()) {
+                const auto &embed = ctx.embeds[region.index];
+                QString link = resolveEmbedAnchor(ctx.model,
+                                                  embedDescDocKey(ctx.messageId, region.index),
+                                                  embed.descriptionParsed, ctx.font, region.rect, mousePos);
+                if (!link.isEmpty())
+                    return HitRegion{ HitRegion::Kind::EmbedLink, region.rect, region.index, -1, link };
+            }
+
+            continue;
+        }
+        case HitRegion::Kind::EmbedFieldName: {
+            if (region.index >= 0 && region.index < ctx.embeds.size() &&
+                region.subIndex >= 0 && region.subIndex < ctx.embeds[region.index].fields.size()) {
+                const auto &field = ctx.embeds[region.index].fields[region.subIndex];
+                QFont nameFont = ctx.font;
+                nameFont.setBold(true);
+                QString link = resolveEmbedAnchor(ctx.model,
+                                                  embedFieldNameDocKey(ctx.messageId, region.index, region.subIndex),
+                                                  field.nameParsed, nameFont, region.rect, mousePos);
+                if (!link.isEmpty())
+                    return HitRegion{ HitRegion::Kind::EmbedLink, region.rect, region.index, region.subIndex, link };
+            }
+            continue;
+        }
+        case HitRegion::Kind::EmbedFieldValue: {
+            if (region.index >= 0 && region.index < ctx.embeds.size() &&
+                region.subIndex >= 0 && region.subIndex < ctx.embeds[region.index].fields.size()) {
+                const auto &field = ctx.embeds[region.index].fields[region.subIndex];
+                QString link = resolveEmbedAnchor(ctx.model,
+                                                  embedFieldValueDocKey(ctx.messageId, region.index, region.subIndex),
+                                                  field.valueParsed, ctx.font, region.rect, mousePos);
+                if (!link.isEmpty())
+                    return HitRegion{ HitRegion::Kind::EmbedLink, region.rect, region.index, region.subIndex, link };
+            }
+            continue;
+        }
+        default:
+            return region;
+        }
+    }
+
+    if (layout.textRect.contains(mousePos) && !ctx.htmlContent.isEmpty() && ctx.model) {
+        QString link = getLinkAt(resolved, mousePos);
+        if (!link.isEmpty())
+            return HitRegion{ HitRegion::Kind::TextLink, layout.textRect, -1, -1, link };
+
+        if (hitTestCharIndex(resolved, mousePos) >= 0)
+            return HitRegion{ HitRegion::Kind::TextCursor, layout.textRect, -1, -1, {} };
+    }
+
+    return std::nullopt;
+}
+
+LayoutContext buildContext(const QModelIndex &index, const QFont &font, const QRect &rowRect,
+                           const QPalette &palette)
+{
+    LayoutContext ctx;
+    ctx.font = font;
+    ctx.rowWidth = rowRect.width();
+    ctx.rowTop = rowRect.top();
+    ctx.showHeader = index.data(ChatModel::ShowHeaderRole).toBool();
+    ctx.hasSeparator = index.data(ChatModel::DateSeparatorRole).toBool();
+    ctx.htmlContent = index.data(ChatModel::HtmlRole).toString();
+    ctx.replyData = index.data(ChatModel::ReplyDataRole).value<ReplyData>();
+    ctx.attachments = index.data(ChatModel::AttachmentsRole).value<QList<AttachmentData>>();
+    ctx.embeds = index.data(ChatModel::EmbedsRole).value<QList<EmbedData>>();
+    ctx.reactions = index.data(ChatModel::ReactionsRole).value<QList<ReactionData>>();
+    ctx.isSystemMessage = index.data(ChatModel::IsSystemMessageRole).toBool();
+    ctx.messageType = static_cast<Discord::MessageType>(index.data(ChatModel::MessageTypeRole).toInt());
+    ctx.forwardOrigin = index.data(ChatModel::ForwardOriginRole).value<ForwardOriginData>();
+    ctx.model = qobject_cast<const ChatModel *>(index.model());
+    ctx.messageId = index.data(ChatModel::MessageIdRole).toULongLong();
+
+    if (index.data(ChatModel::EditedTimestampRole).toDateTime().isValid())
+        ctx.htmlContent += editedMarkerHtml(palette);
+
+    return ctx;
+}
+
+ResolvedLayout resolveLayout(const QAbstractItemView *view, const QModelIndex &index)
+{
+    ResolvedLayout result;
+    if (!view || !index.isValid())
+        return result;
+
+    result.ctx = buildContext(index, view->font(), view->visualRect(index), view->palette());
+    result.layout = calculateMessageLayout(result.ctx);
+    return result;
+}
+
+static QTextDocument *bodyDocument(const ResolvedLayout &resolved, QTextDocument &fallback)
+{
+    const auto &ctx = resolved.ctx;
+    const int textWidth = resolved.layout.textRect.width();
+
+    if (ctx.htmlContent.isEmpty() || !ctx.model)
+        return nullptr;
+
+    QTextDocument *doc = ctx.model->getCachedDocument(bodyDocKey(ctx.messageId));
+    if (!doc) {
+        setupDocument(fallback, ctx.htmlContent, ctx.font, textWidth);
+        return &fallback;
+    }
+    if (int(doc->textWidth()) != textWidth)
+        doc->setTextWidth(textWidth);
+    return doc;
+}
+
+int hitTestCharIndex(const ResolvedLayout &resolved, const QPoint &viewportPos)
+{
+    QTextDocument localDoc;
+    QTextDocument *doc = bodyDocument(resolved, localDoc);
+    if (!doc)
+        return -1;
+
+    QPointF local = viewportPos - resolved.layout.textRect.topLeft();
+
+    if (local.y() < 0 || local.y() > doc->size().height())
+        return -1;
+
+    return doc->documentLayout()->hitTest(local, Qt::ExactHit);
+}
+
+int hitTestCharIndex(const QAbstractItemView *view, const QModelIndex &index, const QPoint &viewportPos)
+{
+    if (!view || !index.isValid())
+        return -1;
+    return hitTestCharIndex(resolveLayout(view, index), viewportPos);
+}
+
+QRectF charRectInDocument(const QTextDocument &doc, int charIndex)
+{
+    if (charIndex < 0)
+        return QRectF();
+    QTextBlock block = doc.findBlock(charIndex);
+    if (!block.isValid())
+        return QRectF();
+
+    int blockPos = block.position();
+    int offset = charIndex - blockPos;
+    QTextLayout *layout = block.layout();
+    if (!layout)
+        return QRectF();
+
+    QTextLine line = layout->lineForTextPosition(offset);
+    if (!line.isValid())
+        return QRectF();
+
+    qreal x1 = line.cursorToX(offset);
+    qreal x2 = line.cursorToX(offset + 1);
+    if (qFuzzyCompare(x1, x2))
+        x2 = x1 + 6;
+    qreal y = doc.documentLayout()->blockBoundingRect(block).top() + line.y();
+    return QRectF(x1, y, x2 - x1, line.height());
+}
+
+QString getLinkAt(const ResolvedLayout &resolved, const QPoint &mousePos)
+{
+    if (!resolved.layout.textRect.contains(mousePos))
+        return {};
+
+    QTextDocument localDoc;
+    QTextDocument *doc = bodyDocument(resolved, localDoc);
+    if (!doc)
+        return {};
+
+    QPointF localPos = mousePos - resolved.layout.textRect.topLeft();
+    return doc->documentLayout()->anchorAt(localPos);
+}
+
+std::optional<QRect> editedMarkerRectAt(const ResolvedLayout &resolved, const QPoint &mousePos)
+{
+    QTextDocument localDoc;
+    QTextDocument *doc = bodyDocument(resolved, localDoc);
+    if (!doc)
+        return std::nullopt;
+
+    const int end = doc->characterCount() - 1;
+    const int start = end - int(editedMarkerText().size());
+    if (start < 0)
+        return std::nullopt;
+
+    QPointF local = mousePos - resolved.layout.textRect.topLeft();
+    const int charPos = doc->documentLayout()->hitTest(local, Qt::ExactHit);
+    if (charPos < start || charPos >= end)
+        return std::nullopt;
+
+    QRectF rect = charRectInDocument(*doc, start) | charRectInDocument(*doc, end - 1);
+    return rect.toAlignedRect().translated(resolved.layout.textRect.topLeft());
+}
+
+QPixmap createBlurredPixmap(const QPixmap &source, int blurRadius)
+{
+    if (source.isNull())
+        return source;
+
+    QGraphicsScene scene;
+    QGraphicsPixmapItem item(source);
+
+    QGraphicsBlurEffect *blur = new QGraphicsBlurEffect;
+    blur->setBlurRadius(blurRadius);
+    blur->setBlurHints(QGraphicsBlurEffect::PerformanceHint);
+    item.setGraphicsEffect(blur);
+
+    scene.addItem(&item);
+
+    QPixmap result(source.size());
+    result.setDevicePixelRatio(source.devicePixelRatio());
+    result.fill(Qt::transparent);
+
+    QPainter painter(&result);
+    scene.render(&painter);
+    painter.end();
+
+    return result;
+}
+
+} // namespace ChatLayout
+} // namespace UI
+} // namespace Acheron

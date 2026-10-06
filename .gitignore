@@ -1,0 +1,13 @@
+out/
+acheron.slnx
+CMakeUserPresets.json
+.vs/
+*.aps
+.planning/
+/build
+/build-*/
+/.deps/
+/.tools/
+/aqtinstall.log
+/artifacts/
+/.runtime-*/

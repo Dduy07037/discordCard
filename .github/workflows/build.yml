@@ -1,0 +1,662 @@
+name: Build
+
+on:
+  push:
+    branches: [master, ci/**]
+  pull_request:
+    branches: [master]
+
+env:
+  CURL_IMPERSONATE_VERSION: v2.0.0
+  # BtbN keeps only the last couple of weeks of daily autobuilds plus one build per
+  # month, so pin a month-end tag: a daily one gets deleted out from under us and
+  # every ffmpeg download starts 404ing.
+  FFMPEG_RELEASE_TAG: autobuild-2026-07-31-14-10
+  FFMPEG_WINDOWS_BUILD: ffmpeg-n8.1.2-34-g9b6c8969e0-win64-lgpl-shared-8.1
+  FFMPEG_WINDOWS_SHA256: c222a490dde4e7059f45495deef6bfb98dbcacc2b43df5b607546252037aa95c
+  # Ubuntu 22.04's ffmpeg is 4.4, older than the 5.1 the player needs, so the
+  # AppImage builds against this prebuilt prefix and bundles it.
+  FFMPEG_LINUX_BUILD: ffmpeg-n8.1.2-34-g9b6c8969e0-linux64-lgpl-shared-8.1
+  FFMPEG_LINUX_SHA256: c882a80f06617149198a98a07a0880a7e881953ae9f9cb931f5be09a4f93caae
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        build_type: [MinSizeRel, RelWithDebInfo]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.2'
+          modules: qtimageformats
+          cache: true
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          git -C vendor/vcpkg fetch --unshallow
+          vendor/vcpkg/bootstrap-vcpkg.bat
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-x64-windows-static-md-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install curl-impersonate
+        shell: pwsh
+        run: |
+          $url = "https://github.com/lexiforest/curl-impersonate/releases/download/${{ env.CURL_IMPERSONATE_VERSION }}/libcurl-impersonate-${{ env.CURL_IMPERSONATE_VERSION }}.x86_64-win32.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile libcurl-impersonate.tar.gz
+          New-Item -ItemType Directory -Path curl-impersonate -Force
+          tar -xzf libcurl-impersonate.tar.gz -C curl-impersonate
+
+      - name: Install ffmpeg
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/${{ env.FFMPEG_RELEASE_TAG }}/${{ env.FFMPEG_WINDOWS_BUILD }}.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+
+          $actual = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne "${{ env.FFMPEG_WINDOWS_SHA256 }}") {
+            throw "ffmpeg archive hash mismatch: expected ${{ env.FFMPEG_WINDOWS_SHA256 }}, got $actual"
+          }
+
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extract -Force
+
+          $inner = Get-ChildItem -Path ffmpeg-extract -Directory | Select-Object -First 1
+          Move-Item -Path $inner.FullName -Destination ffmpeg
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $curlDir = "${{ github.workspace }}/curl-impersonate"
+          $ffmpegDir = "${{ github.workspace }}/ffmpeg"
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR;$ffmpegDir" `
+            -DCURL_INCLUDE_DIR="$curlDir/include" `
+            -DCURL_LIBRARY="$curlDir/lib/libcurl-impersonate_imp.lib" `
+            -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.build_type }} --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C ${{ matrix.build_type }} --output-on-failure
+
+      - name: Deploy Qt
+        shell: pwsh
+        run: |
+          $exe = "${{ github.workspace }}/build/${{ matrix.build_type }}/acheron.exe"
+          windeployqt --no-translations --no-opengl-sw --no-system-d3d-compiler $exe
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          $out = "acheron-windows-${{ matrix.build_type }}"
+          $binDir = "build/${{ matrix.build_type }}"
+          $curlDir = "${{ github.workspace }}/curl-impersonate"
+          New-Item -ItemType Directory -Path $out -Force
+
+          # Copy build output (binary, certs/, fonts/, and everything windeployqt placed alongside it)
+          Copy-Item "$binDir/*" $out -Recurse -Force
+
+          # Copy curl-impersonate DLL
+          Copy-Item "$curlDir/lib/*.dll" $out -Force
+
+          # Drop build leftovers, and the plugins the app can never reach: main.cpp
+          # forces the Fusion style and Storage only ever opens QSQLITE
+          Remove-Item "$out/Test*.exe","$out/*.pdb","$out/*.lib","$out/styles","$out/generic" `
+            -Recurse -ErrorAction SilentlyContinue
+          Get-ChildItem "$out/sqldrivers" -Exclude qsqlite.dll | Remove-Item
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: acheron-windows-${{ matrix.build_type }}
+          path: acheron-windows-${{ matrix.build_type }}
+
+  build-windows-minimal:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.2'
+          modules: qtimageformats
+          cache: true
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          git -C vendor/vcpkg fetch --unshallow
+          vendor/vcpkg/bootstrap-vcpkg.bat
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-x64-windows-static-md-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install curl-impersonate
+        shell: pwsh
+        run: |
+          $url = "https://github.com/lexiforest/curl-impersonate/releases/download/${{ env.CURL_IMPERSONATE_VERSION }}/libcurl-impersonate-${{ env.CURL_IMPERSONATE_VERSION }}.x86_64-win32.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile libcurl-impersonate.tar.gz
+          New-Item -ItemType Directory -Path curl-impersonate -Force
+          tar -xzf libcurl-impersonate.tar.gz -C curl-impersonate
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $curlDir = "${{ github.workspace }}/curl-impersonate"
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR" `
+            -DCURL_INCLUDE_DIR="$curlDir/include" `
+            -DCURL_LIBRARY="$curlDir/lib/libcurl-impersonate_imp.lib" `
+            -DBUILD_TESTS=ON `
+            -DENABLE_VOICE=OFF `
+            -DENABLE_RNNOISE=OFF `
+            -DENABLE_FFMPEG=OFF
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C RelWithDebInfo --output-on-failure
+
+      - name: Deploy Qt
+        shell: pwsh
+        run: |
+          $exe = "${{ github.workspace }}/build/RelWithDebInfo/acheron.exe"
+          windeployqt --no-translations --no-opengl-sw --no-system-d3d-compiler $exe
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          $out = "acheron-windows-minimal"
+          $binDir = "build/RelWithDebInfo"
+          $curlDir = "${{ github.workspace }}/curl-impersonate"
+          New-Item -ItemType Directory -Path $out -Force
+
+          # Copy build output (binary, certs/, fonts/, and everything windeployqt placed alongside it)
+          Copy-Item "$binDir/*" $out -Recurse -Force
+
+          # Copy curl-impersonate DLL
+          Copy-Item "$curlDir/lib/*.dll" $out -Force
+
+          # Drop build leftovers, and the plugins the app can never reach: main.cpp
+          # forces the Fusion style and Storage only ever opens QSQLITE
+          Remove-Item "$out/Test*.exe","$out/*.pdb","$out/*.lib","$out/styles","$out/generic" `
+            -Recurse -ErrorAction SilentlyContinue
+          Get-ChildItem "$out/sqldrivers" -Exclude qsqlite.dll | Remove-Item
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: acheron-windows-minimal
+          path: acheron-windows-minimal
+
+  build-windows-qt5:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # Qt 5.15.2 (Win7 SP1 floor). qtsvg + qtimageformats ship in the default Qt5
+      # archive set, so no explicit modules are needed. Building 5.15.2 with the
+      # runner's current MSVC toolset relies on the src/qt5_compat.h shim that
+      # CMakeLists force-includes (MSVC + Qt5 only).
+      - name: Install Qt (5.15.2)
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '5.15.2'
+          arch: win64_msvc2019_64
+          cache: true
+
+      - name: Bootstrap vcpkg
+        shell: pwsh
+        run: |
+          git -C vendor/vcpkg fetch --unshallow
+          vendor/vcpkg/bootstrap-vcpkg.bat
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v6
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-x64-windows-static-md-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install curl-impersonate
+        shell: pwsh
+        run: |
+          $url = "https://github.com/lexiforest/curl-impersonate/releases/download/${{ env.CURL_IMPERSONATE_VERSION }}/libcurl-impersonate-${{ env.CURL_IMPERSONATE_VERSION }}.x86_64-win32.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile libcurl-impersonate.tar.gz
+          New-Item -ItemType Directory -Path curl-impersonate -Force
+          tar -xzf libcurl-impersonate.tar.gz -C curl-impersonate
+
+      # ENABLE_FFMPEG defaults on and fails configure when ffmpeg is missing, so the
+      # Qt5 job installs it too. That also keeps the video player covered under Qt5
+      # rather than leaving it compiled only by the Qt6 jobs.
+      - name: Install ffmpeg
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/${{ env.FFMPEG_RELEASE_TAG }}/${{ env.FFMPEG_WINDOWS_BUILD }}.zip"
+          Invoke-WebRequest -Uri $url -OutFile ffmpeg.zip
+
+          $actual = (Get-FileHash ffmpeg.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne "${{ env.FFMPEG_WINDOWS_SHA256 }}") {
+            throw "ffmpeg archive hash mismatch: expected ${{ env.FFMPEG_WINDOWS_SHA256 }}, got $actual"
+          }
+
+          Expand-Archive -Path ffmpeg.zip -DestinationPath ffmpeg-extract -Force
+
+          $inner = Get-ChildItem -Path ffmpeg-extract -Directory | Select-Object -First 1
+          Move-Item -Path $inner.FullName -Destination ffmpeg
+
+      - name: Fetch OpenSSL 1.1 (Qt5 runtime TLS)
+        shell: pwsh
+        run: |
+          # Qt 5.15.2's QNetworkAccessManager loads OpenSSL 1.1 at runtime for HTTPS
+          # (avatars/attachments/emoji). The Qt repo only ships OpenSSL 3 now, which the
+          # official 5.15.2 binaries can't use, so pull the 1.1.1 x64 DLLs from FireDaemon.
+          Invoke-WebRequest -Uri "https://download.firedaemon.com/FireDaemon-OpenSSL/openssl-1.1.1w.zip" -OutFile openssl.zip
+          if ((Get-FileHash openssl.zip -Algorithm SHA256).Hash -ne '1870B15BF6749E65FFBBADF52CDFF3EE0E9F02943550BF4395574BB432AF3EB8') {
+              throw "OpenSSL zip checksum mismatch"
+          }
+          Expand-Archive openssl.zip -DestinationPath openssl11 -Force
+          New-Item -ItemType Directory -Path openssl-bin -Force | Out-Null
+          Get-ChildItem -Path openssl11 -Recurse -Include 'libssl-1_1-x64.dll','libcrypto-1_1-x64.dll' |
+            ForEach-Object { Copy-Item $_.FullName openssl-bin -Force }
+          if (-not (Test-Path openssl-bin/libssl-1_1-x64.dll)) { throw "OpenSSL 1.1 x64 DLLs not found in archive" }
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $curlDir = "${{ github.workspace }}/curl-impersonate"
+          $ffmpegDir = "${{ github.workspace }}/ffmpeg"
+          cmake -B build -S . `
+            -DCMAKE_BUILD_TYPE=MinSizeRel `
+            -DVCPKG_TARGET_TRIPLET=x64-windows-static-md `
+            -DCMAKE_PREFIX_PATH="$env:QT_ROOT_DIR;$ffmpegDir" `
+            -DCURL_INCLUDE_DIR="$curlDir/include" `
+            -DCURL_LIBRARY="$curlDir/lib/libcurl-impersonate_imp.lib" `
+            -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --config MinSizeRel --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C MinSizeRel --output-on-failure
+
+      - name: Deploy Qt
+        shell: pwsh
+        run: |
+          $exe = "${{ github.workspace }}/build/MinSizeRel/acheron.exe"
+          windeployqt --no-translations --no-opengl-sw --no-angle --no-system-d3d-compiler $exe
+
+      - name: Prepare artifact
+        shell: pwsh
+        run: |
+          $out = "acheron-windows-qt5-MinSizeRel"
+          $binDir = "build/MinSizeRel"
+          $curlDir = "${{ github.workspace }}/curl-impersonate"
+          New-Item -ItemType Directory -Path $out -Force
+
+          # Copy build output (binary, certs/, fonts/, and everything windeployqt placed alongside it)
+          Copy-Item "$binDir/*" $out -Recurse -Force
+
+          # Copy curl-impersonate DLL
+          Copy-Item "$curlDir/lib/*.dll" $out -Force
+
+          # Bundle OpenSSL 1.1 (fetched from FireDaemon above) next to the exe: Qt5's
+          # QNetworkAccessManager needs it for HTTPS and windeployqt does not deploy it.
+          Copy-Item "openssl-bin/*.dll" $out -Force
+
+          # Drop build leftovers, and the plugins the app can never reach: main.cpp
+          # forces the Fusion style and Storage only ever opens QSQLITE
+          Remove-Item "$out/Test*.exe","$out/*.pdb","$out/*.lib","$out/styles","$out/generic" `
+            -Recurse -ErrorAction SilentlyContinue
+          Get-ChildItem "$out/sqldrivers" -Exclude qsqlite.dll | Remove-Item
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: acheron-windows-qt5-MinSizeRel
+          path: acheron-windows-qt5-MinSizeRel
+
+  build-linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcurl4-openssl-dev libsecret-1-dev zlib1g-dev \
+            libavcodec-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.2'
+          modules: qtimageformats
+          cache: true
+
+      - name: Bootstrap vcpkg
+        run: |
+          git -C vendor/vcpkg fetch --unshallow
+          vendor/vcpkg/bootstrap-vcpkg.sh
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-x64-linux-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install curl-impersonate
+        run: |
+          curl -L -o libcurl-impersonate.tar.gz \
+            "https://github.com/lexiforest/curl-impersonate/releases/download/${{ env.CURL_IMPERSONATE_VERSION }}/libcurl-impersonate-${{ env.CURL_IMPERSONATE_VERSION }}.x86_64-linux-gnu.tar.gz"
+          mkdir -p curl-impersonate
+          tar -xzf libcurl-impersonate.tar.gz -C curl-impersonate
+          KEEP_FLAGS=$(nm --defined-only -g curl-impersonate/libcurl-impersonate.a \
+            | awk '{print $NF}' | grep '^curl_' | sort -u \
+            | sed 's/^/--keep-global-symbol=/' | tr '\n' ' ')
+          objcopy $KEEP_FLAGS \
+            curl-impersonate/libcurl-impersonate.a \
+            curl-impersonate/libcurl-impersonate-local.a
+
+      - name: Configure
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=Release
+          -DVCPKG_TARGET_TRIPLET=x64-linux
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+          -DCURL_INCLUDE_DIR=${{ github.workspace }}/curl-impersonate/include
+          -DCURL_LIBRARY=${{ github.workspace }}/curl-impersonate/libcurl-impersonate-local.a
+          -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+  build-appimage:
+    # ubuntu-22.04, not -latest: the AppImage bundles Qt but not glibc, so the
+    # builder's glibc (2.35 here) is the floor. Covers Debian 12+/Ubuntu 22.04+.
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          # The xcb/xkb set must be installed on the builder for
+          # linuxdeploy-plugin-qt to bundle it; libxcb-cursor0 is a hard
+          # requirement of the xcb platform plugin since Qt 6.5.
+          # No libav*-dev here, unlike build-linux: jammy only has ffmpeg 4.4 and
+          # ffmpeg.cmake would reject it, so the prebuilt prefix below is used instead.
+          sudo apt-get install -y libcurl4-openssl-dev libsecret-1-dev zlib1g-dev \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-shape0 libxcb-xkb1 libxkbcommon-x11-0
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.2'
+          modules: qtimageformats
+          cache: true
+
+      - name: Bootstrap vcpkg
+        run: |
+          git -C vendor/vcpkg fetch --unshallow
+          vendor/vcpkg/bootstrap-vcpkg.sh
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: build/vcpkg_installed
+          # Keyed separately from build-linux: its cache is built on
+          # ubuntu-latest and restoring it here would raise the glibc floor.
+          key: vcpkg-x64-linux-jammy-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install curl-impersonate
+        run: |
+          curl -L -o libcurl-impersonate.tar.gz \
+            "https://github.com/lexiforest/curl-impersonate/releases/download/${{ env.CURL_IMPERSONATE_VERSION }}/libcurl-impersonate-${{ env.CURL_IMPERSONATE_VERSION }}.x86_64-linux-gnu.tar.gz"
+          mkdir -p curl-impersonate
+          tar -xzf libcurl-impersonate.tar.gz -C curl-impersonate
+          KEEP_FLAGS=$(nm --defined-only -g curl-impersonate/libcurl-impersonate.a \
+            | awk '{print $NF}' | grep '^curl_' | sort -u \
+            | sed 's/^/--keep-global-symbol=/' | tr '\n' ' ')
+          objcopy $KEEP_FLAGS \
+            curl-impersonate/libcurl-impersonate.a \
+            curl-impersonate/libcurl-impersonate-local.a
+
+      - name: Install ffmpeg
+        run: |
+          curl -L -o ffmpeg.tar.xz \
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/${{ env.FFMPEG_RELEASE_TAG }}/${{ env.FFMPEG_LINUX_BUILD }}.tar.xz"
+          echo "${{ env.FFMPEG_LINUX_SHA256 }}  ffmpeg.tar.xz" | sha256sum -c -
+          mkdir -p ffmpeg
+          tar -xf ffmpeg.tar.xz -C ffmpeg --strip-components=1
+
+      - name: Configure
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_INSTALL_PREFIX=/usr
+          -DVCPKG_TARGET_TRIPLET=x64-linux
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR;${{ github.workspace }}/ffmpeg"
+          -DCURL_INCLUDE_DIR=${{ github.workspace }}/curl-impersonate/include
+          -DCURL_LIBRARY=${{ github.workspace }}/curl-impersonate/libcurl-impersonate-local.a
+          -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(nproc)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Build AppDir
+        run: |
+          DESTDIR="$PWD/AppDir" cmake --install build
+
+          # The prebuilt libcurl-impersonate.a carries -g, so even a Release binary
+          # ships ~30 MB of DWARF for curl and BoringSSL
+          strip AppDir/usr/bin/acheron
+
+          # linuxdeploy-plugin-qt deploys every sqldriver it finds, and
+          # libqsqlmimer.so needs libmimerapi.so, which no runner has -- the
+          # plugin treats that as fatal. Storage only ever opens QSQLITE
+          # (DatabaseManager.cpp), so drop the rest; that also avoids dragging
+          # in libpq/ldap/sasl/gnutls via the Postgres driver.
+          find "$QT_ROOT_DIR/plugins/sqldrivers" -name '*.so' \
+            ! -name 'libqsqlite.so' -delete
+
+          # Nothing installs a QTranslator, so Qt's own qtbase_*.qm are 5 MB of
+          # strings no one reads; the Windows jobs pass --no-translations for this
+          find "$QT_ROOT_DIR/translations" -name '*.qm' -delete
+
+          # certs/ and fonts/ are resolved relative to applicationDirPath()
+          # (CurlUtils.cpp, main.cpp), so they go next to the binary in
+          # usr/bin, not under usr/share
+          [ -d build/certs ] && cp -r build/certs AppDir/usr/bin/certs
+          [ -d build/fonts ] && cp -r build/fonts AppDir/usr/bin/fonts
+
+
+      - name: Get linuxdeploy
+        run: |
+          curl -L -O https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -L -O https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-x86_64.AppImage
+          # FUSE3-capable runtime: the default embedded runtime dlopens
+          # libfuse.so.2, which Debian 13 & friends no longer ship
+          curl -L -o runtime-x86_64 \
+            https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+          chmod +x linuxdeploy-x86_64.AppImage linuxdeploy-plugin-qt-x86_64.AppImage
+
+      - name: Build AppImage
+        env:
+          # linuxdeploy is itself an AppImage and the runner has no FUSE2
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: |
+          export QMAKE="$QT_ROOT_DIR/bin/qmake"
+          export LDAI_RUNTIME_FILE="$PWD/runtime-x86_64"
+          # cmake --install drops the build-tree rpath, so the installed binary names
+          # libavcodec.so.62 & co with nowhere to find them. linuxdeploy honours
+          # LD_LIBRARY_PATH when resolving DT_NEEDED, and copies what it resolves into
+          # AppDir/usr/lib like any other dependency.
+          export LD_LIBRARY_PATH="$PWD/ffmpeg/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          # Icon: the .desktop file declares Icon=io.github.ouwou.acheron but no
+          # icon is installed by CMake; supply the repo SVG under that name
+          ./linuxdeploy-x86_64.AppImage --appdir AppDir \
+            --plugin qt \
+            --icon-file acheron.svg --icon-filename io.github.ouwou.acheron \
+            --output appimage
+
+      # Nothing in CI runs the packaged binary, so a linuxdeploy that quietly failed to
+      # pick ffmpeg up would ship an AppImage that dies on the first video instead of
+      # failing the build.
+      - name: Check ffmpeg was bundled
+        run: |
+          for lib in libavcodec libavformat libavutil libswscale libswresample; do
+            # -s follows symlinks, so a link left dangling by the copy fails here too
+            [ -s "$(ls AppDir/usr/lib/$lib.so.* 2>/dev/null | head -1)" ] \
+              || { echo "$lib was not bundled into AppDir/usr/lib"; exit 1; }
+          done
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: acheron-appimage
+          path: Acheron*.AppImage
+
+  build-macos:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: brew install curl autoconf automake libtool ffmpeg
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.10.2'
+          modules: qtimageformats
+          cache: true
+
+      - name: Bootstrap vcpkg
+        run: |
+          git -C vendor/vcpkg fetch --unshallow
+          vendor/vcpkg/bootstrap-vcpkg.sh
+
+      - name: Cache vcpkg packages
+        uses: actions/cache@v4
+        with:
+          path: build/vcpkg_installed
+          key: vcpkg-arm64-osx-${{ hashFiles('vcpkg.json') }}
+
+      - name: Install curl-impersonate
+        run: |
+          curl -L -o libcurl-impersonate.tar.gz \
+            "https://github.com/lexiforest/curl-impersonate/releases/download/${{ env.CURL_IMPERSONATE_VERSION }}/libcurl-impersonate-${{ env.CURL_IMPERSONATE_VERSION }}.arm64-macos.tar.gz"
+          mkdir -p curl-impersonate
+          tar -xzf libcurl-impersonate.tar.gz -C curl-impersonate
+
+      - name: Configure
+        run: >
+          cmake -B build -S .
+          -DCMAKE_BUILD_TYPE=Release
+          -DVCPKG_TARGET_TRIPLET=arm64-osx
+          -DCMAKE_PREFIX_PATH="$QT_ROOT_DIR"
+          -DCURL_INCLUDE_DIR="${{ github.workspace }}/curl-impersonate/include"
+          -DCURL_LIBRARY="${{ github.workspace }}/curl-impersonate/libcurl-impersonate.dylib"
+          -DCMAKE_EXE_LINKER_FLAGS="-framework SystemConfiguration -framework Security -framework CoreFoundation -liconv -lz -Wl,-rpath,@executable_path/../Frameworks -Wl,-rpath,${{ github.workspace }}/curl-impersonate"
+          -DBUILD_TESTS=ON
+
+      - name: Build
+        run: cmake --build build --parallel $(sysctl -n hw.logicalcpu)
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Prepare artifact
+        run: |
+          # Create a .app bundle manually since the binary isn't built as MACOSX_BUNDLE
+          app="acheron-macos/Acheron.app/Contents"
+          mkdir -p "$app/MacOS" "$app/Frameworks" "$app/PlugIns"
+
+          cp build/acheron "$app/MacOS/"
+
+          # Copy certs/fonts if present
+          [ -d build/certs ] && cp -r build/certs "$app/MacOS/"
+          [ -d build/fonts ] && cp -r build/fonts "$app/MacOS/"
+
+          # Info.plist
+          cat > "$app/Info.plist" << 'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>acheron</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.acheron.app</string>
+            <key>CFBundleName</key>
+            <string>Acheron</string>
+            <key>CFBundleVersion</key>
+            <string>1.0</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>13.0</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          PLIST
+
+          # Use macdeployqt to bundle Qt frameworks
+          macdeployqt acheron-macos/Acheron.app -verbose=1
+
+          # Same rule as the Windows artifacts: Fusion is forced in main.cpp and
+          # Storage only ever opens QSQLITE
+          plugins="acheron-macos/Acheron.app/Contents/PlugIns"
+          rm -rf "$plugins/styles"
+          find "$plugins/sqldrivers" -name '*.dylib' ! -name 'libqsqlite.dylib' -delete
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: acheron-macos
+          path: acheron-macos
