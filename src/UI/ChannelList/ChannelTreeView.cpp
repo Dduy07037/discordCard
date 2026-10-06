@@ -169,6 +169,14 @@ void ChannelTreeView::contextMenuEvent(QContextMenuEvent *event)
     bool isDMChannel = (nodeType == ChannelNode::Type::DMChannel);
 
     if (isVoiceChannel || isDMChannel) {
+        auto *controls = menu.addAction(tr("Voice Controls / Go Live"));
+#ifdef ACHERON_NO_VOICE
+        controls->setEnabled(false);
+#else
+        connect(controls, &QAction::triggered, this, [this, proxyIndex] {
+            emit openVoiceControlsRequested(proxyIndex);
+        });
+#endif
         QString joinText = isDMChannel ? tr("Join Call") : tr("Join Voice Channel");
         QAction *joinAction = menu.addAction(joinText);
 #ifdef ACHERON_NO_VOICE

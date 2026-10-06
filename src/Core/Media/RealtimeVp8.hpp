@@ -15,7 +15,7 @@ public:
     ~RealtimeVp8();
     RealtimeVp8(const RealtimeVp8 &) = delete;
     RealtimeVp8 &operator=(const RealtimeVp8 &) = delete;
-    bool openEncoder(); // 640x360, 15fps, 600kbps, one thread
+    bool openEncoder(QSize size = QSize(640, 360), int fps = 15, int bitrate = 600000);
     bool openDecoder();
     QByteArray encode(const QImage &image, bool keyframe);
     QImage decode(const QByteArray &frame);

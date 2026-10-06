@@ -39,6 +39,7 @@ public:
     void setAccount(Core::Snowflake accountId);
     void setChannelName(const QString &name);
     void updateConnectionState();
+    void showVoiceWindow();
 
 signals:
     void disconnectRequested();
@@ -51,7 +52,6 @@ private:
     void applyTheme();
     void disconnectManager();
     void toggleVoiceWindow();
-    void showVoiceWindow();
     void configureVoiceWindow();
 
     Core::Audio::VoiceManager *voiceManager = nullptr;

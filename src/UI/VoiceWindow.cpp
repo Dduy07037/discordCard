@@ -311,6 +311,13 @@ void VoiceWindow::setupUi()
     subtitle->setWordWrap(true);
     layout->addWidget(subtitle);
 
+#ifdef ACHERON_HAVE_FFMPEG
+    auto *goLive = new QPushButton(tr("Watch streams / Share screen (experimental)"), this);
+    goLive->setAccessibleName(tr("Open Go Live"));
+    connect(goLive, &QPushButton::clicked, this, &VoiceWindow::openGoLive);
+    layout->addWidget(goLive);
+#endif
+
     auto *usersHeaderRow = new QHBoxLayout;
     usersHeaderRow->setContentsMargins(0, 0, 0, 0);
     auto *usersHeader = new QLabel(tr("Connected Users"), this);
@@ -561,20 +568,6 @@ void VoiceWindow::buildAdvancedSection(QVBoxLayout *parentLayout)
     diagnosticsLabel->setWordWrap(true);
     diagnosticsLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     advLayout->addRow(tr("Diagnostics"), diagnosticsLabel);
-#ifdef ACHERON_HAVE_FFMPEG
-    if (qEnvironmentVariable("ACHERON_GOLIVE_PROBE") == QStringLiteral("1")) {
-        auto *probe = new QPushButton(tr("Open Go Live interoperability probe"), advancedContainer);
-        advLayout->addRow(probe);
-        connect(probe, &QPushButton::clicked, this, [this, probe] {
-            if (!voiceManager || !voiceManager->isConnected())
-                return;
-            auto *dialog = new GoLiveProbeDialog(voiceManager, accountId, this);
-            probe->setEnabled(false);
-            connect(dialog, &QObject::destroyed, probe, [probe] { probe->setEnabled(true); });
-            dialog->show();
-        });
-    }
-#endif
 
 #ifdef ACHERON_HAVE_RNNOISE
     noiseSuppressionCheckbox = new QCheckBox(tr("Noise Suppression"), advancedContainer);
@@ -738,8 +731,21 @@ void VoiceWindow::installResetOnDoubleClick(QWidget *widget, const QVariant &def
     widget->setToolTip(tr("Double-click to reset to default"));
 }
 
+void VoiceWindow::openGoLive()
+{
+#ifdef ACHERON_HAVE_FFMPEG
+    if (!voiceManager) return;
+    if (!goLiveDialog)
+        goLiveDialog = new GoLiveProbeDialog(voiceManager, accountId, this, nameResolver);
+    goLiveDialog->show();
+    goLiveDialog->raise();
+    goLiveDialog->activateWindow();
+#endif
+}
+
 void VoiceWindow::setVoiceManager(Core::Audio::VoiceManager *manager)
 {
+    if (voiceManager != manager && goLiveDialog) goLiveDialog->close();
     if (voiceManager == manager)
         return;
 

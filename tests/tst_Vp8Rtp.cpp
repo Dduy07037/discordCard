@@ -2,6 +2,7 @@
 #include <dave/dave_interfaces.h>
 #include <bytes/bytes.h>
 #include "Discord/Voice/Vp8Rtp.hpp"
+#include "Core/Media/LatestVideoFrame.hpp"
 #ifdef TEST_VP8_CODEC
 #include "Core/Media/RealtimeVp8.hpp"
 #endif
@@ -18,10 +19,34 @@ private slots:
     void descriptorExtensions();
     void boundsAndExpiry();
     void conflictingBoundaries();
+    void newestScreenFrameAndExpiry();
 #ifdef TEST_VP8_CODEC
     void realtimeCodecRoundtrip();
+    void desktopCodecKeepsAspectRatio();
 #endif
 };
+
+void TestVp8Rtp::newestScreenFrameAndExpiry()
+{
+    Acheron::Core::Media::LatestVideoFrame queue;
+    for (int i = 0; i < 1000; ++i) {
+        QImage image(2, 2, QImage::Format_RGB32);
+        image.fill(QColor(i % 256, 0, 0));
+        queue.push(image, i);
+    }
+    const auto newest = queue.take(1000);
+    QVERIFY(newest);
+    QCOMPARE(newest->capturedAtMs, qint64(999));
+    QCOMPARE(newest->image.pixelColor(0, 0).red(), 999 % 256);
+    QVERIFY(!queue.take(1000));
+    queue.push(QImage(2, 2, QImage::Format_RGB32), 1000);
+    QVERIFY(!queue.take(1151));
+    queue.push(QImage(2, 2, QImage::Format_RGB32), 2000);
+    QVERIFY(!queue.take(1999));
+    queue.push(QImage(2, 2, QImage::Format_RGB32), 3000);
+    queue.clear();
+    QVERIFY(!queue.take(3000));
+}
 
 void TestVp8Rtp::daveBeforeFragmentation()
 {
@@ -177,6 +202,26 @@ void TestVp8Rtp::realtimeCodecRoundtrip()
         QVERIFY(std::abs(pixel.blue() - 180) < 8);
     }
     QVERIFY(decoder.decode(QByteArray("invalid")).isNull());
+}
+void TestVp8Rtp::desktopCodecKeepsAspectRatio()
+{
+    Acheron::Core::Media::RealtimeVp8 encoder, decoder;
+    QVERIFY(!encoder.openEncoder(QSize(1281, 720), 15, 1800000));
+    QVERIFY(encoder.openEncoder(QSize(1280, 720), 15, 1800000));
+    QVERIFY(decoder.openDecoder());
+    QImage portrait(600, 1000, QImage::Format_RGB32);
+    portrait.fill(QColor(30, 100, 180));
+    for (int i = 0; i < 15; ++i) {
+        const auto encoded = encoder.encode(portrait, i == 0);
+        QVERIFY(!encoded.isEmpty());
+        const auto decoded = decoder.decode(encoded);
+        QCOMPARE(decoded.size(), QSize(1280, 720));
+        QVERIFY(decoded.pixelColor(100, 360).red() < 8);
+        const auto center = decoded.pixelColor(640, 360);
+        QVERIFY(std::abs(center.red() - 30) < 8);
+        QVERIFY(std::abs(center.green() - 100) < 8);
+        QVERIFY(std::abs(center.blue() - 180) < 8);
+    }
 }
 #endif
 QTEST_GUILESS_MAIN(TestVp8Rtp)

@@ -1387,6 +1387,14 @@ void MainWindow::setupUi()
                 }
             });
 
+    connect(channelTree, &ChannelTreeView::openVoiceControlsRequested, this,
+            [this](const QModelIndex &proxyIndex) {
+                const auto sourceIndex = channelFilterProxy->mapToSource(proxyIndex);
+                auto *node = channelTreeModel->nodeFromIndex(sourceIndex);
+                auto *account = node ? channelTreeModel->getAccountNodeFor(node) : nullptr;
+                if (account) openVoiceControls(account->id);
+            });
+
     connect(channelTree, &ChannelTreeView::disconnectVoiceRequested, this,
             [this](const QModelIndex &proxyIndex) {
                 QModelIndex sourceIndex = channelFilterProxy->mapToSource(proxyIndex);
@@ -1750,6 +1758,25 @@ void MainWindow::recordLastViewedChannel(Snowflake accountId, Snowflake guildId,
 }
 
 #ifndef ACHERON_NO_VOICE
+void MainWindow::openVoiceControls(Core::Snowflake accountId)
+{
+    auto *instance = session->client(accountId);
+    if (!instance) return;
+    QPointer<Core::UserManager> users = instance->users();
+    const auto guild = instance->voiceGuildId();
+    voiceStatusBar->setAccount(accountId);
+    voiceStatusBar->setNameResolver([users, guild](Core::Snowflake user) {
+        return users ? users->getDisplayName(user, guild) : QString::number(user);
+    });
+    voiceStatusBar->setAvatarResolver([users](Core::Snowflake userId) -> QUrl {
+        if (!users) return {};
+        const auto user = users->getUser(userId);
+        return user ? Discord::Cdn::userAvatar(userId, user->avatar.get(), 32) : QUrl();
+    });
+    voiceStatusBar->setVoiceManager(instance->voice());
+    voiceStatusBar->showVoiceWindow();
+}
+
 void MainWindow::updateVoiceStatusLabel()
 {
     using VState = Discord::Voice::VoiceClient::State;
@@ -2156,6 +2183,14 @@ void MainWindow::setupMenu()
     auto *settingsAction = new QAction(tr("&Settings"), this);
     connect(settingsAction, &QAction::triggered, this, &MainWindow::openSettingsWindow);
     viewMenu->addAction(settingsAction);
+
+#ifndef ACHERON_NO_VOICE
+    auto *voiceAction = viewMenu->addAction(tr("&Voice Controls / Go Live"));
+    voiceAction->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_V));
+    connect(voiceAction, &QAction::triggered, this, [this] {
+        if (currentInstance) openVoiceControls(currentInstance->accountId());
+    });
+#endif
 
     // DEBUG: Ctrl+Shift+R to force a Gateway reconnect
     auto *debugReconnect = new QAction(this);

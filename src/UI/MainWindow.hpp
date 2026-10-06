@@ -114,6 +114,7 @@ private:
     void recordLastViewedChannel(Core::Snowflake accountId, Core::Snowflake guildId, Core::Snowflake channelId);
 #ifndef ACHERON_NO_VOICE
     void updateVoiceStatusLabel();
+    void openVoiceControls(Core::Snowflake accountId);
 #endif
 
 private:

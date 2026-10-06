@@ -65,7 +65,7 @@ public:
 
     void setSpeaking(bool speaking);
     // Experimental Go Live adapter: call before start(), on its own worker.
-    void configureVideoSession(Core::Snowflake daveGroupId, bool publisher);
+    void configureVideoSession(Core::Snowflake daveGroupId, bool publisher, bool desktop = false);
     bool sendVideoFrame(const QByteArray &vp8Frame, uint32_t timestamp);
     void advertiseVideo();
 
@@ -113,6 +113,7 @@ private:
     bool videoPublisher = false;
     Core::Snowflake daveGroupId;
     quint32 localVideoSsrc = 0;
+    bool desktopVideo = false;
     quint32 localRtxSsrc = 0;
     uint16_t videoSequence = 0;
     QHash<quint32, Vp8Reassembler> videoAssemblers;

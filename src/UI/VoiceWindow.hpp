@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QWidget>
+#include <QPointer>
 #include <QCheckBox>
 #include <QLabel>
 #include <QSlider>
@@ -18,6 +19,8 @@
 
 #include "Core/Snowflake.hpp"
 #include "UI/AvatarRequestTracker.hpp"
+
+class QDialog;
 
 namespace Acheron {
 namespace Core {
@@ -129,6 +132,7 @@ public:
     void setImageManager(Core::ImageManager *manager);
     void setAccount(Core::Snowflake accountId);
     void refreshDevices();
+    void openGoLive();
 
 protected:
     bool eventFilter(QObject *obj, QEvent *event) override;
@@ -156,6 +160,7 @@ private:
     void showPrivacyCode();
 
     Core::Audio::VoiceManager *voiceManager = nullptr;
+    QPointer<QDialog> goLiveDialog;
     Core::ImageManager *imageManager = nullptr;
     Core::Snowflake accountId;
     QMetaObject::Connection imageFetchedConn;

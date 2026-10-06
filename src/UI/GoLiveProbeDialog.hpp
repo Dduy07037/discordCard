@@ -5,30 +5,39 @@
 #include <QPointer>
 #include <QThread>
 #include <memory>
+#include <functional>
 #include "Core/Snowflake.hpp"
 
 class QLabel;
 class QCheckBox;
 class QComboBox;
+class QPushButton;
+class QScreen;
+class QTimer;
 
 namespace Acheron::Core::Audio { class VoiceManager; }
+namespace Acheron::Core::Media { class LatestVideoFrame; }
 
 namespace Acheron::UI {
 class ProbeMediaWorker;
 struct ProbeFrameMailbox;
 
-// Developer-only protocol probe, enabled by ACHERON_GOLIVE_PROBE=1.
-// It publishes a generated test card and optional tone, never the desktop/mic.
+// Experimental VP8/DAVE viewer and explicit, user-selected monitor sharing.
+// The protocol test card/tone is an optional diagnostic, not the default source.
 class GoLiveProbeDialog : public QDialog
 {
     Q_OBJECT
 public:
     GoLiveProbeDialog(Core::Audio::VoiceManager *manager, Core::Snowflake accountId,
-                      QWidget *parent = nullptr);
+                      QWidget *parent = nullptr,
+                      std::function<QString(Core::Snowflake)> nameResolver = {});
     ~GoLiveProbeDialog() override;
 private:
     void openSession(const QString &key, const QJsonObject &connection);
     void closeSession(const QString &key);
+    void refreshScreens();
+    void captureDesktop();
+    void stopCapture();
     struct Session {
         QString key;
         QThread *thread = nullptr;
@@ -42,6 +51,15 @@ private:
     QCheckBox *tone = nullptr;
     QCheckBox *sound = nullptr;
     QComboBox *streams = nullptr;
+    QComboBox *screens = nullptr;
+    QList<QPointer<QScreen>> screenList;
+    QPointer<QScreen> capturedScreen;
+    QTimer *captureTimer = nullptr;
+    QLabel *preview = nullptr;
+    QLabel *sharingStatus = nullptr;
+    QPushButton *share = nullptr;
+    QPushButton *testCard = nullptr;
+    std::shared_ptr<Core::Media::LatestVideoFrame> captureFrames;
     Session viewer;
     Session publisher;
     QString requestedViewer;

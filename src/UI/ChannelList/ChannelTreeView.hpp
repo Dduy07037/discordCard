@@ -28,6 +28,7 @@ signals:
     void markAsReadRequested(const QModelIndex &proxyIndex);
     void openInNewTabRequested(const QModelIndex &proxyIndex);
     void joinVoiceChannelRequested(const QModelIndex &proxyIndex);
+    void openVoiceControlsRequested(const QModelIndex &proxyIndex);
     void disconnectVoiceRequested(const QModelIndex &proxyIndex);
     void joinThreadRequested(const QModelIndex &proxyIndex);
     void leaveThreadRequested(const QModelIndex &proxyIndex);

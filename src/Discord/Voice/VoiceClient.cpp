@@ -415,11 +415,12 @@ void VoiceClient::sendAudio(const QByteArray &opusData, qint64 capturedAtMs)
     lastAudioSendTime = now;
 }
 
-void VoiceClient::configureVideoSession(Core::Snowflake groupId, bool publisher)
+void VoiceClient::configureVideoSession(Core::Snowflake groupId, bool publisher, bool desktop)
 {
     Q_ASSERT(currentState == State::Disconnected);
     videoSession = true;
     videoPublisher = publisher;
+    desktopVideo = desktop;
     daveGroupId = groupId;
 }
 
@@ -437,8 +438,9 @@ void VoiceClient::advertiseVideo()
     }
     const QJsonObject stream{{"type", "video"}, {"rid", "100"}, {"ssrc", qint64(localVideoSsrc)},
         {"rtx_ssrc", qint64(localRtxSsrc)}, {"active", true}, {"quality", 100},
-        {"max_bitrate", 600000}, {"max_framerate", 15},
-        {"max_resolution", QJsonObject{{"type", "fixed"}, {"width", 640}, {"height", 360}}}};
+        {"max_bitrate", desktopVideo ? 1800000 : 600000}, {"max_framerate", 15},
+        {"max_resolution", QJsonObject{{"type", "fixed"}, {"width", desktopVideo ? 1280 : 640},
+                                      {"height", desktopVideo ? 720 : 360}}}};
     gateway->sendVideoState({{"audio_ssrc", qint64(localSsrc)}, {"video_ssrc", qint64(localVideoSsrc)},
         {"rtx_ssrc", qint64(localRtxSsrc)}, {"streams", QJsonArray{stream}}});
 }

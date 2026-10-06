@@ -1,4 +1,5 @@
 #include "RealtimeVp8.hpp"
+#include <QPainter>
 #include <cstring>
 
 extern "C" {
@@ -35,10 +36,17 @@ RealtimeVp8::RealtimeVp8() : impl(std::make_unique<Impl>()) {}
 RealtimeVp8::~RealtimeVp8() = default;
 QString RealtimeVp8::error() const { return impl->error; }
 
-bool RealtimeVp8::openEncoder()
+bool RealtimeVp8::openEncoder(QSize size, int fps, int bitrate)
 {
+    if (size.width() < 2 || size.height() < 2 || size.width() > 1920 || size.height() > 1080
+        || size.width() % 2 || size.height() % 2 || fps < 1 || fps > 30
+        || bitrate < 100000 || bitrate > 5000000) {
+        impl->error = QStringLiteral("Invalid realtime video encoder settings.");
+        return false;
+    }
     if (impl->encoder)
-        return true;
+        return impl->encoder->width == size.width() && impl->encoder->height == size.height()
+            && impl->encoder->framerate.num == fps && impl->encoder->bit_rate == bitrate;
     const auto *codec = avcodec_find_encoder_by_name("libvpx");
     if (!codec) {
         impl->error = QStringLiteral("This FFmpeg build has no libvpx VP8 encoder.");
@@ -47,15 +55,15 @@ bool RealtimeVp8::openEncoder()
     auto *context = avcodec_alloc_context3(codec);
     if (!context)
         return false;
-    context->width = 640;
-    context->height = 360;
-    context->time_base = AVRational{1, 15};
-    context->framerate = AVRational{15, 1};
+    context->width = size.width();
+    context->height = size.height();
+    context->time_base = AVRational{1, fps};
+    context->framerate = AVRational{fps, 1};
     context->pix_fmt = AV_PIX_FMT_YUV420P;
-    context->bit_rate = 600000;
-    context->rc_max_rate = 600000;
-    context->rc_buffer_size = 600000;
-    context->gop_size = 15;
+    context->bit_rate = bitrate;
+    context->rc_max_rate = bitrate;
+    context->rc_buffer_size = bitrate;
+    context->gop_size = fps;
     context->max_b_frames = 0;
     context->thread_count = 1;
     av_opt_set(context->priv_data, "deadline", "realtime", 0);
@@ -102,9 +110,17 @@ QByteArray RealtimeVp8::encode(const QImage &image, bool keyframe)
 {
     if (!impl->encoder || image.isNull() || av_frame_make_writable(impl->input) < 0)
         return {};
-    const auto rgb = image.convertToFormat(QImage::Format_RGBA8888);
+    // Letterbox non-16:9 monitors instead of stretching their desktop contents.
+    QImage rgb(impl->encoder->width, impl->encoder->height, QImage::Format_RGBA8888);
+    rgb.fill(Qt::black);
+    const auto fitted = image.size().scaled(rgb.size(), Qt::KeepAspectRatio);
+    {
+        QPainter painter(&rgb);
+        painter.drawImage(QRect(QPoint((rgb.width() - fitted.width()) / 2,
+                                      (rgb.height() - fitted.height()) / 2), fitted), image);
+    }
     impl->encodeScale = sws_getCachedContext(impl->encodeScale, rgb.width(), rgb.height(), AV_PIX_FMT_RGBA,
-        640, 360, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+        impl->encoder->width, impl->encoder->height, AV_PIX_FMT_YUV420P, SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
     if (!impl->encodeScale)
         return {};
     const uint8_t *source[] = {rgb.constBits()};
