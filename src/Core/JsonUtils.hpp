@@ -10,7 +10,7 @@
 
 #include "Snowflake.hpp"
 
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+#if QT_VERSION < QT_VERSION_CHECK(6, 9, 0)
 #include "qt_flags.hpp"
 #endif
 
@@ -27,7 +27,7 @@ template <typename T>
 struct is_qflags<QFlags<T>> : std::true_type
 {
 };
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+#if QT_VERSION < QT_VERSION_CHECK(6, 9, 0)
 template <typename T>
 struct is_qflags<::Acheron::Compat::Flags<T>> : std::true_type
 {
@@ -156,7 +156,7 @@ protected:
                 return value;
             }
         }
-#if QT_VERSION < QT_VERSION_CHECK(6, 0, 0)
+#if QT_VERSION < QT_VERSION_CHECK(6, 9, 0)
         friend QDebug operator<<(QDebug dbg, const Field &f) { return dbg << f.value; }
 #endif
 
@@ -248,7 +248,7 @@ protected:
         } else if constexpr (std::is_same_v<T, QString>) {
             return value.toString();
         } else if constexpr (QFlagType<T>) {
-            return T::fromInt(value.toInt());
+            return T::fromInt(static_cast<typename T::Int>(value.toVariant().toULongLong()));
         } else if constexpr (std::is_enum_v<T>) {
             return static_cast<T>(value.toInt());
         } else if constexpr (std::is_same_v<T, QByteArray>) {

@@ -98,6 +98,7 @@ Client::Client(const QString &token, const QString &gatewayUrl, const QString &b
     connect(gateway, &Gateway::gatewayPresenceUpdate, this, &Client::presenceUpdated);
     connect(gateway, &Gateway::gatewayVoiceStateUpdate, this, &Client::voiceStateUpdated);
     connect(gateway, &Gateway::gatewayVoiceServerUpdate, this, &Client::voiceServerUpdated);
+    connect(gateway, &Gateway::gatewayStreamEvent, this, &Client::streamEventReceived);
     connect(gateway, &Gateway::gatewayRelationshipAdd, this, &Client::relationshipAdded);
     connect(gateway, &Gateway::gatewayRelationshipUpdate, this, &Client::relationshipUpdated);
     connect(gateway, &Gateway::gatewayRelationshipRemove, this, &Client::relationshipRemoved);
@@ -1082,6 +1083,11 @@ qint64 Client::getMaxUploadSize(Snowflake channelId) const
     }
 
     return qMax(userLimit, guildLimit);
+}
+
+void Client::sendStreamRequest(int opcode, const QJsonObject &data)
+{
+    gateway->sendStreamRequest(opcode, data);
 }
 
 void Client::sendVoiceStateUpdate(Snowflake guildId, Snowflake channelId, bool selfMute, bool selfDeaf)

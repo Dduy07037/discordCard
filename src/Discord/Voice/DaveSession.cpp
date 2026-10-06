@@ -59,6 +59,8 @@ void DaveSession::reinit()
     daveEncryptor->SetPassthroughMode(true);
     if (localSsrc != 0)
         daveEncryptor->AssignSsrcToCodec(localSsrc, discord::dave::Codec::Opus);
+    if (videoSsrc != 0)
+        daveEncryptor->AssignSsrcToCodec(videoSsrc, discord::dave::Codec::VP8);
 
     auto keyPackage = mlsSession->GetMarshalledKeyPackage();
     if (!keyPackage.empty()) {
@@ -309,6 +311,13 @@ discord::dave::IDecryptor *DaveSession::getOrCreateDecryptor(quint32 ssrc, uint6
     qCDebug(LogDave) << "Created decryptor for SSRC =" << ssrc
                      << "hasRatchet =" << hasRatchet;
     return ptr;
+}
+
+void DaveSession::setVideoSsrc(quint32 ssrc)
+{
+    videoSsrc = ssrc;
+    if (daveEncryptor && ssrc != 0)
+        daveEncryptor->AssignSsrcToCodec(ssrc, discord::dave::Codec::VP8);
 }
 
 void DaveSession::setLocalSsrc(quint32 ssrc)

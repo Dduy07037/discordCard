@@ -60,10 +60,11 @@ public:
 
     [[nodiscard]] virtual int queuedPlaybackFrames() const = 0;
     virtual unsigned int takePlaybackUnderruns() = 0;
+    [[nodiscard]] virtual quint64 captureDroppedFrames() const { return 0; }
     virtual bool pushPlaybackFrame(const int16_t *frame) = 0;
 
 signals:
-    void audioCaptured(const QByteArray &pcmData);
+    void audioCaptured(const QByteArray &pcmData, qint64 capturedAtMs);
     void devicesChanged(const QList<AudioDeviceInfo> &inputs, const QList<AudioDeviceInfo> &outputs);
 };
 

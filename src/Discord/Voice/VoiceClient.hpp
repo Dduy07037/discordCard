@@ -4,6 +4,7 @@
 #include <QTimer>
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -14,7 +15,9 @@
 #include "Core/ProxyConfig.hpp"
 #include "Core/Snowflake.hpp"
 #include "VoiceEnums.hpp"
+#include "Core/Audio/AudioSendQueue.hpp"
 #include "VoiceEntities.hpp"
+#include "Vp8Rtp.hpp"
 
 namespace Acheron {
 namespace Discord {
@@ -57,8 +60,14 @@ public:
     void seedConnectedUsers(const QList<Core::Snowflake> &userIds);
 
     void sendAudio(const QByteArray &opusData, qint64 capturedAtMs = -1);
+    void setSendQueue(const std::shared_ptr<Core::Audio::AudioSendQueue> &queue) { sendQueue = queue; }
+    void drainAudio();
 
     void setSpeaking(bool speaking);
+    // Experimental Go Live adapter: call before start(), on its own worker.
+    void configureVideoSession(Core::Snowflake daveGroupId, bool publisher);
+    bool sendVideoFrame(const QByteArray &vp8Frame, uint32_t timestamp);
+    void advertiseVideo();
 
     bool isDaveEnabled() const;
     void requestVerificationCode(Core::Snowflake targetUserId, std::function<void(const QString &)> callback);
@@ -74,7 +83,10 @@ signals:
 
     void audioReceived(quint32 ssrc, uint16_t sequence, uint32_t timestamp, const QByteArray &opusData);
 
+    void videoReceived(quint32 ssrc, uint32_t timestamp, const QByteArray &vp8Frame);
+    void videoError(const QString &reason);
     void privacyCodeChanged(const QString &code);
+    void sendDiagnosticsUpdated(const QJsonObject &stats);
 
 private slots:
     void onGatewayConnected();
@@ -97,6 +109,20 @@ private:
     void ensureDaveSession(uint16_t protocolVersion);
 
 private:
+    bool videoSession = false;
+    bool videoPublisher = false;
+    Core::Snowflake daveGroupId;
+    quint32 localVideoSsrc = 0;
+    quint32 localRtxSsrc = 0;
+    uint16_t videoSequence = 0;
+    QHash<quint32, Vp8Reassembler> videoAssemblers;
+    QHash<quint32, quint32> rtxToVideoSsrc;
+    QList<QByteArray> videoFragments;
+    uint32_t pendingVideoTimestamp = 0;
+    int videoFragmentIndex = 0;
+    qint64 pendingVideoAtMs = 0;
+    QTimer *videoPacer = nullptr;
+    std::shared_ptr<Core::Audio::AudioSendQueue> sendQueue;
     VoiceGateway *gateway = nullptr;
     UdpTransport *udpTransport = nullptr;
 
@@ -128,13 +154,16 @@ private:
     std::chrono::steady_clock::time_point rtpEpoch;
     std::chrono::steady_clock::time_point lastAudioSendTime;
     bool newTalkspurt = false;
+    std::array<qint64, 256> sendAges{};
+    unsigned sendAgeCount = 0;
+    qint64 lastSendDiagnosticsMs = 0;
 
     std::unique_ptr<DaveSession> daveSession;
     std::set<std::string> connectedUserIds;
     QHash<quint32, uint64_t> ssrcToUserIdMap;
 
     static constexpr int KEEPALIVE_INTERVAL_MS = 10000;
-    static constexpr qint64 MAX_CAPTURE_QUEUE_AGE_MS = 120;
+    static constexpr qint64 MAX_CAPTURE_QUEUE_AGE_MS = Core::Audio::AudioSendQueue::MaxAgeMs;
 };
 
 } // namespace Voice

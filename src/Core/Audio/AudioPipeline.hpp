@@ -4,6 +4,9 @@
 #include <QByteArray>
 #include <QElapsedTimer>
 #include <QHash>
+#include <QJsonObject>
+#include <array>
+#include "AudioSendQueue.hpp"
 #include <QVector>
 
 #include <memory>
@@ -38,6 +41,7 @@ class AudioPipeline : public QObject
 public:
     explicit AudioPipeline(QObject *parent = nullptr);
     ~AudioPipeline() override;
+    void setSendQueue(const std::shared_ptr<AudioSendQueue> &queue) { sendQueue = queue; }
 
 public slots:
     void start(IAudioBackend *backend, bool capturing);
@@ -68,16 +72,27 @@ public slots:
     void setOpusPacketLossPercent(int percent);
 
 signals:
-    void encodedAudioReady(const QByteArray &opusData, qint64 capturedAtMs);
+    void audioPacketsAvailable();
+    void diagnosticsUpdated(const QJsonObject &stats);
     void speakingChanged(bool speaking);
     void audioLevelChanged(float rms);
     void userAudioLevelChanged(Snowflake userId, float rms);
 
 private slots:
-    void onAudioCaptured(const QByteArray &pcmData);
+    void onAudioCaptured(const QByteArray &pcmData, qint64 capturedAtMs);
     void onMixTick();
 
 private:
+    void submitEncodedAudio(const QByteArray &data, qint64 capturedAtMs, bool silence = false);
+    void publishDiagnostics(qint64 nowMs);
+    std::shared_ptr<AudioSendQueue> sendQueue;
+    std::array<qint64, 256> captureAges{};
+    unsigned captureAgeCount = 0;
+    quint64 staleBeforeEncode = 0;
+    quint64 measuredUnderruns = 0;
+    qint64 lastDiagnosticsMs = 0;
+    qint64 lastMixMs = 0;
+    qint64 maxMixLatenessMs = 0;
     bool detectVoiceActivity(const QByteArray &pcmFrame, float &outRms) const;
     bool mixOneFrame();
     void sendTrailingSilence();

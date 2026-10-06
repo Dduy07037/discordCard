@@ -42,6 +42,7 @@ public:
     void requestGuildMembers(Core::Snowflake guildId, const QList<Core::Snowflake> &userIds);
     void requestForumUnreads(Core::Snowflake guildId, Core::Snowflake forumId,
                              const QList<QPair<Core::Snowflake, Core::Snowflake>> &threads);
+    void sendStreamRequest(int opcode, const QJsonObject &data);
     void sendVoiceStateUpdate(Core::Snowflake guildId, Core::Snowflake channelId, bool selfMute, bool selfDeaf);
 
     // Debug: simulate a server RECONNECT opcode
@@ -92,6 +93,7 @@ signals:
     void gatewayPresenceUpdate(const PresenceUpdate &data);
     void gatewayVoiceStateUpdate(const VoiceState &data);
     void gatewayVoiceServerUpdate(const VoiceServerUpdate &data);
+    void gatewayStreamEvent(const QString &event, const QJsonObject &data);
     void gatewayRelationshipAdd(const Relationship &data);
     void gatewayRelationshipUpdate(const RelationshipPartial &data);
     void gatewayRelationshipRemove(const RelationshipPartial &data);

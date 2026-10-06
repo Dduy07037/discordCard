@@ -34,6 +34,9 @@ public:
 
     void sendSelectProtocol(const QString &address, int port, const QString &mode);
     void sendSpeaking(int flags, int delay, quint32 ssrc);
+    void setVideoSession(bool enabled) { videoSession = enabled; }
+    void sendVideoState(const QJsonObject &data);
+    void sendMediaSinkWants(const QJsonObject &data);
     void sendBinaryPayload(int opcode, const QByteArray &data);
     void sendDaveReadyForTransition(int transitionId);
     void sendDaveInvalidCommitWelcome(int transitionId);
@@ -88,6 +91,7 @@ private:
     void heartbeatLoop();
 
 private:
+    bool videoSession = false;
     QString endpoint;
     Core::Snowflake serverId;
     Core::Snowflake channelId;

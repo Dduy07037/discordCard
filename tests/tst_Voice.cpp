@@ -1,10 +1,14 @@
 #include "Core/Audio/IAudioBackend.hpp"
+#include "Core/Audio/CaptureQueue.hpp"
+#include "Core/Audio/AudioSendQueue.hpp"
+#include "Core/Audio/AudioPipeline.hpp"
 #include "Core/Audio/JitterBuffer.hpp"
 #include "Core/Audio/OpusDecoder.hpp"
 #include "Core/Audio/OpusEncoder.hpp"
 #include "Discord/Voice/VoiceEntities.hpp"
 
 #include <QTest>
+#include <QSignalSpy>
 
 #include <dave/dave_interfaces.h>
 
@@ -12,10 +16,36 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <thread>
 
 using namespace Acheron;
 using namespace Acheron::Core::Audio;
 using namespace Acheron::Discord::Voice;
+
+class FakeAudioBackend : public IAudioBackend
+{
+public:
+    QList<AudioDeviceInfo> availableInputDevices() const override { return {}; }
+    QList<AudioDeviceInfo> availableOutputDevices() const override { return {}; }
+    QByteArray currentInputDevice() const override { return {}; }
+    QByteArray currentOutputDevice() const override { return {}; }
+    void setInputDevice(const QByteArray &) override {}
+    void setOutputDevice(const QByteArray &) override {}
+    bool startCapture() override { capturing = true; return true; }
+    void stopCapture() override { capturing = false; }
+    bool startPlayback() override { playing = true; return true; }
+    void stopPlayback() override { playing = false; }
+    bool isCapturing() const override { return capturing; }
+    bool isPlaying() const override { return playing; }
+    int nativeCaptureChannels() const override { return 2; }
+    void setInputGain(float) override {}
+    void setOutputVolume(float) override {}
+    int queuedPlaybackFrames() const override { return 0; }
+    unsigned int takePlaybackUnderruns() override { return 0; }
+    bool pushPlaybackFrame(const int16_t *) override { return true; }
+    bool capturing = false;
+    bool playing = false;
+};
 
 class TestVoice : public QObject
 {
@@ -29,7 +59,215 @@ private slots:
     void jitterBufferWaitsForPacketBeforeDeclaringLoss();
     void opusFecDecodeProducesOneFrame();
     void davePassthroughIsExplicitAndBounded();
+    void captureQueuePreservesSamplesAndCaptureTime();
+    void captureQueueBoundsOverflowAndRestarts();
+    void captureQueueConcurrentProducerConsumer();
+    void sendQueueCoalescesWakeupsAndDropsBacklog();
+    void sendQueuePreservesTrailingSilence();
+    void jitterBufferBoundsStalledReceiver();
+    void jitterBufferResyncsAfterRtpSilence();
+    void jitterBufferAcceptsRtpTimestampWrap();
+    void pipelinePreservesCaptureTimestampAndRejectsStalePcm();
+    void sendQueueBoundsOverflow();
 };
+
+void TestVoice::pipelinePreservesCaptureTimestampAndRejectsStalePcm()
+{
+    FakeAudioBackend backend;
+    AudioPipeline pipeline;
+    auto queue = std::make_shared<AudioSendQueue>();
+    pipeline.setSendQueue(queue);
+    pipeline.setNoiseSuppressionEnabled(false);
+    pipeline.setUseRnnoiseVad(false);
+    pipeline.setVadThreshold(0);
+    pipeline.start(&backend, true);
+    QSignalSpy available(&pipeline, &AudioPipeline::audioPacketsAvailable);
+    QByteArray pcm(AUDIO_FRAME_SIZE, '\0');
+    auto *samples = reinterpret_cast<int16_t *>(pcm.data());
+    std::fill(samples, samples + AUDIO_FRAME_SIZE / sizeof(int16_t), 1000);
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    emit backend.audioCaptured(pcm, now - 150);
+    QCOMPARE(available.size(), 0);
+    emit backend.audioCaptured(pcm, now - 30);
+    QCOMPARE(available.size(), 1);
+    bool gap = false;
+    const auto packets = queue->take(now, gap);
+    QCOMPARE(packets.size(), 1);
+    QCOMPARE(packets.first().capturedAtMs, qint64(now - 30));
+    QVERIFY(!packets.first().data.isEmpty());
+    // Muting must remove unsent microphone data and preserve the five-packet
+    // silence boundary, even with a drain notification already pending.
+    emit backend.audioCaptured(pcm, now - 20);
+    pipeline.stopCapture();
+    const auto silence = queue->take(now + 20, gap);
+    QCOMPARE(silence.size(), 5);
+    for (const auto &packet : silence)
+        QVERIFY(packet.silence);
+    pipeline.stop();
+    QVERIFY(!backend.capturing);
+    QVERIFY(!backend.playing);
+    emit backend.audioCaptured(pcm, now);
+    QCOMPARE(available.size(), 2);
+}
+
+void TestVoice::sendQueueBoundsOverflow()
+{
+    AudioSendQueue queue;
+    unsigned wakeups = 0;
+    for (int i = 0; i < 1000; ++i)
+        wakeups += queue.push(QByteArray::number(i), 1000);
+    QCOMPARE(wakeups, 1u);
+    bool gap = false;
+    const auto packets = queue.take(1020, gap);
+    QCOMPARE(packets.size(), 1);
+    QCOMPARE(packets.first().data, QByteArray("999"));
+    QCOMPARE(queue.droppedCount(), quint64(999));
+    QVERIFY(gap);
+}
+
+void TestVoice::captureQueuePreservesSamplesAndCaptureTime()
+{
+    CaptureQueue queue;
+    std::array<int16_t, 1920> input;
+    for (unsigned i = 0; i < input.size(); ++i)
+        input[i] = int16_t(i);
+    // Device callbacks need not line up with the 20 ms Opus boundary.
+    queue.append(input.data(), 240, 1005000);
+    queue.append(input.data() + 480, 720, 1020000);
+    CaptureQueue::Frame frame;
+    QVERIFY(queue.pop(frame));
+    QCOMPARE(frame.capturedAtUs, int64_t(1000000));
+    QVERIFY(frame.samples == input);
+    QVERIFY(!queue.pop(frame));
+}
+
+void TestVoice::captureQueueBoundsOverflowAndRestarts()
+{
+    CaptureQueue queue;
+    std::array<int16_t, 1920> input{};
+    for (unsigned i = 0; i < CaptureQueue::Capacity + 10; ++i)
+        queue.append(input.data(), 960, 1000000 + i * 20000);
+    QCOMPARE(queue.overflowCount(), uint64_t(10));
+    CaptureQueue::Frame frame;
+    unsigned consumed = 0;
+    while (queue.pop(frame))
+        ++consumed;
+    QCOMPARE(consumed, CaptureQueue::Capacity);
+    queue.reset();
+    queue.append(input.data(), 960, 3000000);
+    QVERIFY(queue.pop(frame));
+    QCOMPARE(frame.capturedAtUs, int64_t(2980000));
+    QCOMPARE(queue.overflowCount(), uint64_t(0));
+}
+
+void TestVoice::captureQueueConcurrentProducerConsumer()
+{
+    CaptureQueue queue;
+    std::atomic<bool> done{false};
+    std::thread producer([&] {
+        std::array<int16_t, 1920> input;
+        for (uint32_t n = 1; n <= 10000; ++n) {
+            for (unsigned i = 0; i < input.size(); i += 2) {
+                input[i] = int16_t(n & 0xffff);
+                input[i + 1] = int16_t(n >> 16);
+            }
+            queue.append(input.data(), 960, int64_t(n) * 20000);
+        }
+        done.store(true, std::memory_order_release);
+    });
+    bool consistent = true;
+    uint32_t previous = 0;
+    unsigned consumed = 0;
+    CaptureQueue::Frame frame;
+    for (;;) {
+        if (!queue.pop(frame)) {
+            if (!done.load(std::memory_order_acquire))
+                continue;
+            if (!queue.pop(frame))
+                break;
+        }
+        const uint32_t n = uint16_t(frame.samples[0]) | (uint32_t(uint16_t(frame.samples[1])) << 16);
+        consistent &= n > previous && frame.capturedAtUs == int64_t(n - 1) * 20000;
+        for (unsigned i = 0; i < frame.samples.size(); i += 2)
+            consistent &= frame.samples[i] == frame.samples[0] && frame.samples[i + 1] == frame.samples[1];
+        previous = n;
+        ++consumed;
+    }
+    producer.join();
+    QVERIFY(consistent);
+    QVERIFY(consumed > 0);
+    QCOMPARE(uint64_t(consumed) + queue.overflowCount(), uint64_t(10000));
+}
+
+void TestVoice::sendQueueCoalescesWakeupsAndDropsBacklog()
+{
+    AudioSendQueue queue;
+    QVERIFY(queue.push("old", 1000));
+    QVERIFY(!queue.push("middle", 1120));
+    QVERIFY(!queue.push("fresh", 1140));
+    bool gap = false;
+    const auto batch = queue.take(1160, gap);
+    QCOMPARE(batch.size(), 1);
+    QCOMPARE(batch.first().data, QByteArray("fresh"));
+    QCOMPARE(batch.first().capturedAtMs, qint64(1140));
+    QVERIFY(gap);
+    QCOMPARE(queue.droppedCount(), quint64(2));
+    QVERIFY(queue.push("next", 1180));
+    QCOMPARE(queue.take(1200, gap).size(), 1);
+    QVERIFY(!gap);
+}
+
+void TestVoice::sendQueuePreservesTrailingSilence()
+{
+    AudioSendQueue queue;
+    queue.push("speech", 1000);
+    for (int i = 0; i < 5; ++i)
+        queue.push("silence", 1001, true);
+    bool gap = false;
+    const auto batch = queue.take(1020, gap);
+    QCOMPARE(batch.size(), 6);
+    QCOMPARE(batch.first().data, QByteArray("speech"));
+    for (int i = 1; i < batch.size(); ++i)
+        QVERIFY(batch[i].silence);
+    QVERIFY(!gap);
+}
+
+void TestVoice::jitterBufferBoundsStalledReceiver()
+{
+    JitterBuffer buffer;
+    for (uint16_t i = 0; i < 100; ++i) {
+        buffer.push(i, QByteArray::number(i));
+        QVERIFY(buffer.bufferedPacketCount() <= 10);
+    }
+    QVERIFY(buffer.isReady());
+    QCOMPARE(buffer.pop(), QByteArray("90"));
+}
+
+void TestVoice::jitterBufferResyncsAfterRtpSilence()
+{
+    JitterBuffer buffer;
+    buffer.push(10, 1000, "old-a");
+    buffer.push(11, 1960, "old-b");
+    buffer.push(12, 2920, "old-c");
+    buffer.push(13, 48000, "new-a");
+    QVERIFY(!buffer.isReady());
+    buffer.push(14, 48960, "new-b");
+    buffer.push(15, 49920, "new-c");
+    QVERIFY(buffer.isReady());
+    QCOMPARE(buffer.pop(), QByteArray("new-a"));
+}
+
+void TestVoice::jitterBufferAcceptsRtpTimestampWrap()
+{
+    JitterBuffer buffer;
+    buffer.push(65534, UINT32_MAX - 959, "a");
+    buffer.push(65535, 0, "b");
+    buffer.push(0, 960, "c");
+    QCOMPARE(buffer.pop(), QByteArray("a"));
+    QCOMPARE(buffer.pop(), QByteArray("b"));
+    QCOMPARE(buffer.pop(), QByteArray("c"));
+}
 
 void TestVoice::resumeIncludesSequenceAck()
 {

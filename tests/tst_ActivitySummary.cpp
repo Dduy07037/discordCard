@@ -10,6 +10,7 @@ class TestActivitySummary : public QObject
     Q_OBJECT
 
 private slots:
+    void preservesHighPermissionBits();
     void formatsPlayingActivity();
     void honorsStatusDisplayType();
     void formatsCustomStatus();
@@ -19,6 +20,21 @@ private slots:
     void parsesMemberListPresence();
     void parsesLivePresenceUpdate();
 };
+
+void TestActivitySummary::preservesHighPermissionBits()
+{
+    struct Envelope : Acheron::Core::JsonUtils::JsonObject {
+        Permissions parse(const QJsonValue &value) { return fromJsonValue<Permissions>(value); }
+        QJsonValue write(Permissions value) { return toJsonValue(value); }
+    } envelope;
+    const auto bits = Permission::USE_EXTERNAL_APPS | Permission::MANAGE_EVENTS;
+    const auto expected = quint64(1) << 50 | quint64(1) << 33;
+    QCOMPARE(quint64(bits.toInt()), expected);
+    QCOMPARE(quint64(envelope.parse(envelope.write(bits)).toInt()), expected);
+    QCOMPARE(quint64(envelope.parse(QString::number(expected)).toInt()), expected);
+    const auto role = Role::fromJson({{"permissions", QString::number(expected)}});
+    QCOMPARE(quint64(role.permissions.get().toInt()), expected);
+}
 
 void TestActivitySummary::formatsPlayingActivity()
 {

@@ -161,6 +161,11 @@ void Gateway::handleDispatch(const Inbound &data)
     QString t = data.t.value_or("");
     qCDebug(LogDiscord) << "Received dispatch event" << t;
 
+    if (t == QStringLiteral("STREAM_CREATE") || t == QStringLiteral("STREAM_SERVER_UPDATE") ||
+        t == QStringLiteral("STREAM_UPDATE") || t == QStringLiteral("STREAM_DELETE")) {
+        emit gatewayStreamEvent(t, data.data.toObject());
+        return;
+    }
     GatewayEvent event = parseGatewayEvent(t);
 
     switch (event) {
@@ -619,6 +624,14 @@ void Gateway::requestGuildMembers(Core::Snowflake guildId, const QList<Core::Sno
     request.presences = false;
 
     sendPayload(request.toJson());
+}
+
+void Gateway::sendStreamRequest(int opcode, const QJsonObject &data)
+{
+    if (opcode != int(OpCode::STREAM_CREATE) && opcode != int(OpCode::STREAM_WATCH) &&
+        opcode != int(OpCode::STREAM_DELETE) && opcode != int(OpCode::STREAM_SET_PAUSED))
+        return;
+    sendPayload(QJsonObject{{"op", opcode}, {"d", data}});
 }
 
 void Gateway::sendVoiceStateUpdate(Core::Snowflake guildId, Core::Snowflake channelId, bool selfMute, bool selfDeaf)

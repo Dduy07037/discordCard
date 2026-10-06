@@ -1,4 +1,7 @@
 #include "VoiceWindow.hpp"
+#ifdef ACHERON_HAVE_FFMPEG
+#include "GoLiveProbeDialog.hpp"
+#endif
 
 #include "Core/Audio/VoiceManager.hpp"
 #include "Core/ImageManager.hpp"
@@ -554,6 +557,25 @@ void VoiceWindow::buildAdvancedSection(QVBoxLayout *parentLayout)
     advLayout->addRow(tr("Packet Loss"),
                       makeSliderRow(packetLossSlider, packetLossValue, 0, 100, 36));
 
+    diagnosticsLabel = new QLabel(tr("Waiting for audio measurements…"), advancedContainer);
+    diagnosticsLabel->setWordWrap(true);
+    diagnosticsLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    advLayout->addRow(tr("Diagnostics"), diagnosticsLabel);
+#ifdef ACHERON_HAVE_FFMPEG
+    if (qEnvironmentVariable("ACHERON_GOLIVE_PROBE") == QStringLiteral("1")) {
+        auto *probe = new QPushButton(tr("Open Go Live interoperability probe"), advancedContainer);
+        advLayout->addRow(probe);
+        connect(probe, &QPushButton::clicked, this, [this, probe] {
+            if (!voiceManager || !voiceManager->isConnected())
+                return;
+            auto *dialog = new GoLiveProbeDialog(voiceManager, accountId, this);
+            probe->setEnabled(false);
+            connect(dialog, &QObject::destroyed, probe, [probe] { probe->setEnabled(true); });
+            dialog->show();
+        });
+    }
+#endif
+
 #ifdef ACHERON_HAVE_RNNOISE
     noiseSuppressionCheckbox = new QCheckBox(tr("Noise Suppression"), advancedContainer);
     advLayout->addRow(QString(), noiseSuppressionCheckbox);
@@ -724,10 +746,23 @@ void VoiceWindow::setVoiceManager(Core::Audio::VoiceManager *manager)
     disconnectManager();
     voiceManager = manager;
 
+    diagnosticsLabel->setText(tr("Waiting for audio measurements…"));
+
     if (!voiceManager)
         return;
 
     connect(voiceManager, &Core::Audio::VoiceManager::audioLevelChanged, volumeMeter, &VolumeMeter::setLevel);
+    connect(voiceManager, &Core::Audio::VoiceManager::diagnosticsUpdated, this,
+            [this](const QJsonObject &stats) {
+                const QString send = stats.value("capture_to_send_samples").toInt() > 0
+                    ? tr("%1 ms").arg(stats.value("capture_to_send_p95_ms").toInt()) : tr("No speech samples");
+                diagnosticsLabel->setText(tr("Microphone to send, p95: %1\n"
+                    "Capture/send drops: %2 / %3\nPlayback underruns: %4; queued: %5 ms")
+                    .arg(send).arg(stats.value("capture_dropped_frames").toVariant().toULongLong())
+                    .arg(stats.value("send_queue_dropped_frames").toVariant().toULongLong())
+                    .arg(stats.value("playback_underruns").toVariant().toULongLong())
+                    .arg(stats.value("playback_queued_ms").toInt()));
+            });
     connect(voiceManager, &Core::Audio::VoiceManager::devicesChanged, this, &VoiceWindow::refreshDevices);
     connect(voiceManager, &Core::Audio::VoiceManager::participantJoined, this, &VoiceWindow::onParticipantJoined);
     connect(voiceManager, &Core::Audio::VoiceManager::participantLeft, this, &VoiceWindow::onParticipantLeft);

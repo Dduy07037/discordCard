@@ -5,6 +5,9 @@
 #include "Core/Audio/AudioBackends.hpp"
 #include "Core/Logging.hpp"
 
+#include <QTimer>
+
+#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -112,6 +115,10 @@ MiniaudioAudioBackend::MiniaudioAudioBackend(QObject *parent)
     : IAudioBackend(parent),
       ma(std::make_unique<MiniaudioState>())
 {
+    captureDrainTimer = new QTimer(this);
+    captureDrainTimer->setTimerType(Qt::PreciseTimer);
+    captureDrainTimer->setInterval(5);
+    connect(captureDrainTimer, &QTimer::timeout, this, &MiniaudioAudioBackend::drainCapture);
     if (ma_log_init(nullptr, &ma->log) == MA_SUCCESS) {
         ma->logInit = true;
         ma_log_register_callback(&ma->log, ma_log_callback_init(MiniaudioLogCallback, nullptr));
@@ -220,7 +227,8 @@ bool MiniaudioAudioBackend::startCapture()
         return false;
     }
 
-    captureBuffer.clear();
+    captureQueue.reset();
+    staleCaptureFrames = 0;
 
     if (ma_device_start(&ma->captureDevice) != MA_SUCCESS) {
         qCWarning(LogVoice) << "Failed to start miniaudio capture device";
@@ -229,6 +237,7 @@ bool MiniaudioAudioBackend::startCapture()
     }
 
     ma->captureDeviceInit = true;
+    captureDrainTimer->start();
     selectedInputId = SerializeDeviceId(ma->captureDevice.capture.id);
     qCInfo(LogVoice) << "Miniaudio capture started:" << ma->captureDevice.capture.name;
     return true;
@@ -239,10 +248,12 @@ void MiniaudioAudioBackend::stopCapture()
     if (!ma->captureDeviceInit)
         return;
 
+    captureDrainTimer->stop();
     // ma_device_uninit stops the device and waits for callbacks to finish
     ma_device_uninit(&ma->captureDevice);
     ma->captureDeviceInit = false;
-    captureBuffer.clear();
+    captureQueue.reset();
+    staleCaptureFrames = 0;
 
     qCInfo(LogVoice) << "Miniaudio capture stopped";
 }
@@ -296,7 +307,6 @@ void MiniaudioAudioBackend::stopPlayback()
 {
     if (!ma->playbackDeviceInit)
         return;
-
     // ma_device_uninit stops the device and waits for callbacks to finish
     ma_device_uninit(&ma->playbackDevice);
     ma->playbackDeviceInit = false;
@@ -370,28 +380,36 @@ void MiniaudioAudioBackend::handleCapturedFrames(const void *input, unsigned int
 {
     if (!input)
         return;
+    const auto nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    captureQueue.append(static_cast<const int16_t *>(input), frameCount, nowUs);
+}
 
-    int bytes = static_cast<int>(frameCount) * AUDIO_CHANNELS * AUDIO_SAMPLE_BYTES;
-    captureBuffer.append(static_cast<const char *>(input), bytes);
+quint64 MiniaudioAudioBackend::captureDroppedFrames() const
+{
+    return captureQueue.overflowCount() + staleCaptureFrames;
+}
 
-    float gain = inputGain.load(std::memory_order_relaxed);
-
-    while (captureBuffer.size() >= AUDIO_FRAME_SIZE) {
-        QByteArray frame = captureBuffer.left(AUDIO_FRAME_SIZE);
-        captureBuffer.remove(0, AUDIO_FRAME_SIZE);
-
+void MiniaudioAudioBackend::drainCapture()
+{
+    CaptureQueue::Frame captured;
+    // Bound each timer turn too, so sustained capture cannot starve playout.
+    for (unsigned i = 0; i < CaptureQueue::Capacity && captureQueue.pop(captured); ++i) {
+        const auto nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        if (nowUs - captured.capturedAtUs > 80000) {
+            ++staleCaptureFrames;
+            continue;
+        }
+        const float gain = inputGain.load(std::memory_order_relaxed);
         if (gain != 1.0f) {
-            auto *samples = reinterpret_cast<int16_t *>(frame.data());
-            int count = frame.size() / static_cast<int>(sizeof(int16_t));
-            for (int i = 0; i < count; i++) {
-                int32_t val = static_cast<int32_t>(std::lround(samples[i] * gain));
-                samples[i] = static_cast<int16_t>(std::clamp(val,
-                                                             static_cast<int32_t>(INT16_MIN),
-                                                             static_cast<int32_t>(INT16_MAX)));
+            for (auto &sample : captured.samples) {
+                const int32_t value = static_cast<int32_t>(std::lround(sample * gain));
+                sample = static_cast<int16_t>(std::clamp(value, int32_t(INT16_MIN), int32_t(INT16_MAX)));
             }
         }
-
-        emit audioCaptured(frame);
+        const QByteArray pcm(reinterpret_cast<const char *>(captured.samples.data()), AUDIO_FRAME_SIZE);
+        emit audioCaptured(pcm, captured.capturedAtUs / 1000);
     }
 }
 

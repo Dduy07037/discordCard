@@ -1,5 +1,7 @@
 #include "JitterBuffer.hpp"
 
+#include <algorithm>
+
 namespace Acheron {
 namespace Core {
 namespace Audio {
@@ -10,7 +12,7 @@ bool JitterBuffer::seqNewer(uint16_t a, uint16_t b)
 }
 
 JitterBuffer::JitterBuffer(int capacity)
-    : capacity(capacity)
+    : capacity(std::clamp(capacity, MAX_TARGET_DELAY, 100))
 {
 }
 
@@ -33,6 +35,14 @@ void JitterBuffer::push(uint16_t sequence, const QByteArray &data)
     if (seqNewer(nextSequence, sequence))
         return;
 
+    if (data.isEmpty() || frames.contains(sequence))
+        return;
+    if (frames.size() >= capacity) {
+        // Do not retain a growing delayed talkspurt after the worker stalls.
+        reset();
+        nextSequence = sequence;
+        initialized = true;
+    }
     frames.insert(sequence, data);
 
     // Evict frames that are too far behind the playback pointer
@@ -46,6 +56,28 @@ void JitterBuffer::push(uint16_t sequence, const QByteArray &data)
 
     if (prebuffering && frames.size() >= targetDelay)
         prebuffering = false;
+}
+
+void JitterBuffer::push(uint16_t sequence, uint32_t timestamp, const QByteArray &data)
+{
+    if (data.isEmpty())
+        return;
+    if (hasTimestamp && seqNewer(sequence, lastReceivedSequence)) {
+        const auto sequenceDistance = static_cast<uint16_t>(sequence - lastReceivedSequence);
+        const auto timestampDistance = static_cast<int32_t>(timestamp - lastReceivedTimestamp);
+        // RTP time keeps advancing during intentional silence, while sequence
+        // numbers count sent packets. Do not play an old talkspurt into a new
+        // one or mistake that silence for a long series of lost packets.
+        if (timestampDistance > int32_t(sequenceDistance) * 960 + 1920)
+            reset();
+    }
+    const bool newer = !hasTimestamp || seqNewer(sequence, lastReceivedSequence);
+    push(sequence, data);
+    if (newer && !data.isEmpty()) {
+        hasTimestamp = true;
+        lastReceivedSequence = sequence;
+        lastReceivedTimestamp = timestamp;
+    }
 }
 
 QByteArray JitterBuffer::pop()
@@ -124,6 +156,7 @@ void JitterBuffer::reset()
     prebuffering = true;
     consecutiveMisses = 0;
     consecutiveHits = 0;
+    hasTimestamp = false;
 }
 
 } // namespace Audio

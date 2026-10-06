@@ -77,11 +77,32 @@ void VoiceGateway::sendSelectProtocol(const QString &address, int port, const QS
     data.port = port;
     data.mode = mode;
     data.codecs = { opus };
+    if (videoSession) {
+        Codec vp8;
+        vp8.name = "VP8";
+        vp8.payloadType = 103;
+        vp8.rtxPayloadType = 104;
+        vp8.priority = 1000;
+        vp8.type = "video";
+        vp8.encode = true;
+        vp8.decode = true;
+        data.codecs->append(vp8);
+    }
 
     QJsonObject obj;
     obj["op"] = static_cast<int>(VoiceOpCode::SELECT_PROTOCOL);
     obj["d"] = data.toJson();
     sendPayload(obj);
+}
+
+void VoiceGateway::sendVideoState(const QJsonObject &data)
+{
+    sendPayload(QJsonObject{{"op", 12}, {"d", data}});
+}
+
+void VoiceGateway::sendMediaSinkWants(const QJsonObject &data)
+{
+    sendPayload(QJsonObject{{"op", 15}, {"d", data}});
 }
 
 void VoiceGateway::sendSpeaking(int flags, int delay, quint32 ssrc)
@@ -328,7 +349,13 @@ void VoiceGateway::identify()
 
     QJsonObject obj;
     obj["op"] = static_cast<int>(VoiceOpCode::IDENTIFY);
-    obj["d"] = id.toJson();
+    auto data = id.toJson();
+    if (videoSession) {
+        data.remove("channel_id");
+        data.insert("video", true);
+        data.insert("streams", QJsonArray{QJsonObject{{"type", "video"}, {"rid", "100"}, {"quality", 100}}});
+    }
+    obj["d"] = data;
     sendPayload(obj);
 }
 

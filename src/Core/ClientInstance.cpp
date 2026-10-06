@@ -269,6 +269,10 @@ ClientInstance::ClientInstance(const AccountInfo &info,
 
                 voiceManager->handleVoiceServerUpdate(event);
             });
+    connect(client, &Discord::Client::streamEventReceived,
+            voiceManager->goLive(), &Audio::GoLiveSignaling::handleEvent);
+    connect(voiceManager->goLive(), &Audio::GoLiveSignaling::gatewayRequest,
+            client, &Discord::Client::sendStreamRequest);
 #endif
 }
 

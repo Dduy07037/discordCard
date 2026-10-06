@@ -56,6 +56,7 @@ public:
     std::vector<uint8_t> lastEpochAuthenticator() const;
 
     void setLocalSsrc(quint32 ssrc);
+    void setVideoSsrc(quint32 ssrc);
     void addConnectedUser(const std::string &userId);
     void removeConnectedUser(const std::string &userId);
     void applyKeyRatchetForSsrc(quint32 ssrc, uint64_t userId);
@@ -82,6 +83,7 @@ private:
     Core::Snowflake channelId;
     Core::Snowflake userId;
     quint32 localSsrc = 0;
+    quint32 videoSsrc = 0;
 
     std::set<std::string> connectedUserIds;
     int pendingTransitionId = -1;

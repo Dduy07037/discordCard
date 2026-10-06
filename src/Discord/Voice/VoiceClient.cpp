@@ -10,6 +10,8 @@
 #include "Core/Logging.hpp"
 
 #include <array>
+#include <algorithm>
+#include <cstring>
 
 namespace Acheron {
 namespace Discord {
@@ -80,6 +82,8 @@ void VoiceClient::start()
     setState(State::Connecting);
 
     gateway = new VoiceGateway(endpoint, serverId, channelId, userId, sessionId, token, proxy, this);
+
+    gateway->setVideoSession(videoSession);
 
     connect(gateway, &VoiceGateway::connected, this, &VoiceClient::onGatewayConnected);
     connect(gateway, &VoiceGateway::disconnected, this, &VoiceClient::onGatewayDisconnected);
@@ -162,6 +166,15 @@ void VoiceClient::stop()
 
 void VoiceClient::cleanupTransport()
 {
+    if (videoPacer) {
+        videoPacer->stop();
+        delete videoPacer;
+        videoPacer = nullptr;
+    }
+    videoFragments.clear();
+    videoAssemblers.clear();
+    rtxToVideoSsrc.clear();
+    videoSequence = 0;
     if (keepaliveTimer) {
         keepaliveTimer->stop();
         delete keepaliveTimer;
@@ -209,6 +222,12 @@ void VoiceClient::onGatewayReady(const VoiceReady &data)
     serverIp = data.ip;
     serverPort = data.port;
     serverModes = data.modes;
+    localVideoSsrc = localRtxSsrc = 0;
+    if (videoSession && !data.streams.isEmpty()) {
+        const auto stream = data.streams.first().toObject();
+        localVideoSsrc = quint32(stream.value("ssrc").toDouble());
+        localRtxSsrc = quint32(stream.value("rtx_ssrc").toDouble());
+    }
 
     static const std::array preferred = {
         EncryptionMode::AEAD_AES256_GCM_RTPSIZE,
@@ -248,6 +267,11 @@ void VoiceClient::onSessionDescription(const SessionDescription &desc)
     qCInfo(LogVoice) << "Session established: mode =" << desc.mode
                      << "key length =" << desc.secretKey->size();
 
+    if (videoSession && desc.videoCodec.get().compare("VP8", Qt::CaseInsensitive) != 0) {
+        emit videoError(tr("The stream server did not select VP8."));
+        stop();
+        return;
+    }
     sessionKey = desc.secretKey;
     selectedMode = desc.mode;
 
@@ -256,6 +280,11 @@ void VoiceClient::onSessionDescription(const SessionDescription &desc)
 
     int daveVersion = desc.daveProtocolVersion.hasValue() ? desc.daveProtocolVersion.get() : 0;
     qCInfo(LogVoice) << "dave_protocol_version =" << daveVersion;
+    if (videoSession && daveVersion <= 0) {
+        emit videoError(tr("This probe requires a DAVE stream session."));
+        stop();
+        return;
+    }
 
     if (daveVersion > 0)
         ensureDaveSession(static_cast<uint16_t>(daveVersion));
@@ -273,6 +302,36 @@ void VoiceClient::onSessionDescription(const SessionDescription &desc)
         connect(keepaliveTimer, &QTimer::timeout, this, &VoiceClient::sendSilence);
     }
     keepaliveTimer->start(KEEPALIVE_INTERVAL_MS);
+}
+
+void VoiceClient::drainAudio()
+{
+    if (!sendQueue)
+        return;
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    bool discontinuity = false;
+    const auto packets = sendQueue->take(nowMs, discontinuity);
+    if (discontinuity)
+        newTalkspurt = true;
+    for (const auto &packet : packets)
+        sendAudio(packet.data, packet.capturedAtMs);
+    if (nowMs - lastSendDiagnosticsMs >= 5000) {
+        auto ages = sendAges;
+        const auto count = std::min<size_t>(sendAgeCount, ages.size());
+        std::sort(ages.begin(), ages.begin() + count);
+        auto percentile = [&](unsigned p) -> qint64 {
+            return count ? ages[(count - 1) * p / 100] : 0;
+        };
+        emit sendDiagnosticsUpdated({
+            {"capture_to_send_p50_ms", double(percentile(50))},
+            {"capture_to_send_p95_ms", double(percentile(95))},
+            {"capture_to_send_p99_ms", double(percentile(99))},
+            {"capture_to_send_samples", double(count)}
+        });
+        sendAgeCount = 0;
+        lastSendDiagnosticsMs = nowMs;
+    }
 }
 
 void VoiceClient::sendAudio(const QByteArray &opusData, qint64 capturedAtMs)
@@ -296,8 +355,11 @@ void VoiceClient::sendAudio(const QByteArray &opusData, qint64 capturedAtMs)
     // snap rtp timestamp back to wall clock after a period of silence
     // otherwise its a little behind and it will be played back delayed by discord
     if (newTalkspurt) {
-        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - rtpEpoch);
-        rtpTimestamp = static_cast<uint32_t>(static_cast<uint64_t>(elapsed.count()) * 48 / 1000);
+        const auto epochMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            rtpEpoch.time_since_epoch()).count();
+        const auto sampleTimeMs = capturedAtMs >= 0 ? capturedAtMs :
+            std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()).count();
+        rtpTimestamp = static_cast<uint32_t>(std::max<qint64>(0, sampleTimeMs - epochMs) * 48);
     } else {
         rtpTimestamp += OPUS_FRAME_SAMPLES;
     }
@@ -343,7 +405,98 @@ void VoiceClient::sendAudio(const QByteArray &opusData, qint64 capturedAtMs)
     QByteArray packet = headerBytes + encryptedSection;
     udpTransport->send(packet);
 
+    if (capturedAtMs >= 0 && (opusData.size() != sizeof(Core::Audio::OPUS_SILENCE) ||
+            std::memcmp(opusData.constData(), Core::Audio::OPUS_SILENCE, sizeof(Core::Audio::OPUS_SILENCE)) != 0)) {
+        const auto sentAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        sendAges[sendAgeCount++ % sendAges.size()] = sentAtMs - capturedAtMs;
+    }
+
     lastAudioSendTime = now;
+}
+
+void VoiceClient::configureVideoSession(Core::Snowflake groupId, bool publisher)
+{
+    Q_ASSERT(currentState == State::Disconnected);
+    videoSession = true;
+    videoPublisher = publisher;
+    daveGroupId = groupId;
+}
+
+void VoiceClient::advertiseVideo()
+{
+    if (!gateway || !videoSession || currentState != State::Connected)
+        return;
+    if (!videoPublisher) {
+        gateway->sendMediaSinkWants({{"any", 100}});
+        return;
+    }
+    if (!localVideoSsrc) {
+        emit videoError(tr("The stream server did not assign a video SSRC."));
+        return;
+    }
+    const QJsonObject stream{{"type", "video"}, {"rid", "100"}, {"ssrc", qint64(localVideoSsrc)},
+        {"rtx_ssrc", qint64(localRtxSsrc)}, {"active", true}, {"quality", 100},
+        {"max_bitrate", 600000}, {"max_framerate", 15},
+        {"max_resolution", QJsonObject{{"type", "fixed"}, {"width", 640}, {"height", 360}}}};
+    gateway->sendVideoState({{"audio_ssrc", qint64(localSsrc)}, {"video_ssrc", qint64(localVideoSsrc)},
+        {"rtx_ssrc", qint64(localRtxSsrc)}, {"streams", QJsonArray{stream}}});
+}
+
+bool VoiceClient::sendVideoFrame(const QByteArray &frame, uint32_t timestamp)
+{
+    // Do not send plaintext video during MLS setup. The probe waits for DAVE.
+    if (!videoSession || !videoPublisher || !localVideoSsrc || !isDaveEnabled() ||
+        currentState != State::Connected || !encryption || !udpTransport ||
+        !videoFragments.isEmpty() || frame.isEmpty() || frame.size() > 128 * 1024)
+        return false;
+    auto *enc = daveSession->encryptor();
+    QByteArray ciphertext(int(enc->GetMaxCiphertextByteSize(discord::dave::MediaType::Video, frame.size())), '\0');
+    size_t written = 0;
+    const auto result = enc->Encrypt(discord::dave::MediaType::Video, localVideoSsrc,
+        discord::dave::ArrayView<const uint8_t>(reinterpret_cast<const uint8_t *>(frame.constData()), frame.size()),
+        discord::dave::ArrayView<uint8_t>(reinterpret_cast<uint8_t *>(ciphertext.data()), ciphertext.size()), &written);
+    if (result != discord::dave::IEncryptor::Success)
+        return false;
+    ciphertext.resize(int(written));
+    videoFragments = packetizeVp8(ciphertext);
+    videoFragmentIndex = 0;
+    pendingVideoTimestamp = timestamp;
+    pendingVideoAtMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (!videoPacer) {
+        videoPacer = new QTimer(this);
+        videoPacer->setTimerType(Qt::PreciseTimer);
+        videoPacer->setInterval(2);
+        connect(videoPacer, &QTimer::timeout, this, [this] {
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            if (nowMs - pendingVideoAtMs > 150 || !encryption || !udpTransport) {
+                videoFragments.clear();
+                videoPacer->stop();
+                return;
+            }
+            // Bounded pacing, never queue another encoded frame behind this one.
+            for (int i = 0; i < 2 && videoFragmentIndex < videoFragments.size(); ++i) {
+                RtpHeader header;
+                header.payloadType = 103;
+                header.sequence = videoSequence++;
+                header.timestamp = pendingVideoTimestamp;
+                header.ssrc = localVideoSsrc;
+                header.marker = videoFragmentIndex + 1 == videoFragments.size();
+                const auto bytes = header.serialize();
+                const auto encrypted = encryption->encrypt(bytes, videoFragments[videoFragmentIndex++]);
+                if (!encrypted.isEmpty())
+                    udpTransport->send(bytes + encrypted);
+            }
+            if (videoFragmentIndex >= videoFragments.size()) {
+                videoFragments.clear();
+                videoPacer->stop();
+            }
+        });
+    }
+    videoPacer->start();
+    return true;
 }
 
 void VoiceClient::setSpeaking(bool speaking)
@@ -354,7 +507,7 @@ void VoiceClient::setSpeaking(bool speaking)
     if (speaking)
         newTalkspurt = true;
 
-    int flags = speaking ? static_cast<int>(SpeakingFlag::MICROPHONE) : 0;
+    int flags = speaking ? (videoSession ? 2 : static_cast<int>(SpeakingFlag::MICROPHONE)) : 0;
     gateway->sendSpeaking(flags, 0, localSsrc);
 }
 
@@ -386,13 +539,10 @@ void VoiceClient::onDatagram(const QByteArray &data)
     if (((p[0] >> 6) & 0x03) != 2)
         return;
 
-    // ignore all non-opus packets. theres rtcp and other stuff
-    uint8_t payloadType = p[1] & 0x7F;
-    if (payloadType != 120)
-        return;
-
-    // too small to contain meaningful audio after encryption overhead
-    if (data.size() < 44)
+    // VP8 and its RTX are accepted only on the separate stream session.
+    const uint8_t payloadType = p[1] & 0x7F;
+    const bool video = videoSession && (payloadType == 103 || payloadType == 104);
+    if (payloadType != 120 && !video)
         return;
 
     // rtp header and extension header are unencrypted and used for aad in rtpsize.
@@ -438,6 +588,47 @@ void VoiceClient::onDatagram(const QByteArray &data)
         if (decrypted.size() <= extBytes)
             return;
         decrypted = decrypted.mid(extBytes);
+    }
+
+    if (header.padding) {
+        const auto padding = quint8(decrypted.back());
+        if (padding == 0 || padding >= decrypted.size())
+            return;
+        decrypted.chop(padding);
+    }
+
+    if (video) {
+        quint32 mediaSsrc = header.ssrc;
+        uint16_t sequence = header.sequence;
+        if (payloadType == 104) {
+            if (decrypted.size() < 3 || !ssrcToUserIdMap.contains(header.ssrc))
+                return;
+            sequence = (quint8(decrypted[0]) << 8) | quint8(decrypted[1]);
+            decrypted.remove(0, 2);
+            // RTX SSRCs are mapped from SESSION_UPDATE, not guessed.
+            mediaSsrc = rtxToVideoSsrc.value(header.ssrc, 0);
+            if (!mediaSsrc)
+                return;
+        }
+        if (!videoAssemblers.contains(mediaSsrc) && videoAssemblers.size() >= 4)
+            return;
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto frame = videoAssemblers[mediaSsrc].push(sequence, header.timestamp,
+                                                   header.marker, decrypted, nowMs);
+        if (!frame || !daveSession)
+            return;
+        auto *dec = daveSession->getOrCreateDecryptor(mediaSsrc, ssrcToUserIdMap.value(mediaSsrc, 0));
+        QByteArray plaintext(int(dec->GetMaxPlaintextByteSize(discord::dave::MediaType::Video, frame->size())), '\0');
+        size_t written = 0;
+        const auto result = dec->Decrypt(discord::dave::MediaType::Video,
+            discord::dave::ArrayView<const uint8_t>(reinterpret_cast<const uint8_t *>(frame->constData()), frame->size()),
+            discord::dave::ArrayView<uint8_t>(reinterpret_cast<uint8_t *>(plaintext.data()), plaintext.size()), &written);
+        if (result != discord::dave::IDecryptor::Success)
+            return;
+        plaintext.resize(int(written));
+        emit videoReceived(mediaSsrc, header.timestamp, plaintext);
+        return;
     }
 
     if (daveSession) {
@@ -540,8 +731,28 @@ void VoiceClient::onClientConnect(const ClientConnectData &data)
         connectedUserIds.insert(uid);
         if (data.audioSsrc.get() != 0)
             ssrcToUserIdMap.insert(data.audioSsrc, data.userId.get());
-        if (daveSession)
+        if (data.videoSsrc.get() != 0)
+            ssrcToUserIdMap.insert(data.videoSsrc, data.userId.get());
+        for (const auto &entry : data.streams) {
+            const auto stream = entry.toObject();
+            const auto videoSsrc = quint32(stream.value("ssrc").toDouble());
+            const auto rtxSsrc = quint32(stream.value("rtx_ssrc").toDouble());
+            if (videoSsrc) {
+                ssrcToUserIdMap.insert(videoSsrc, data.userId.get());
+                if (rtxSsrc) {
+                    ssrcToUserIdMap.insert(rtxSsrc, data.userId.get());
+                    rtxToVideoSsrc.insert(rtxSsrc, videoSsrc);
+                }
+            }
+        }
+        if (daveSession) {
             daveSession->addConnectedUser(uid);
+            for (auto it = ssrcToUserIdMap.cbegin(); it != ssrcToUserIdMap.cend(); ++it)
+                if (it.value() == quint64(data.userId.get()))
+                    daveSession->applyKeyRatchetForSsrc(it.key(), it.value());
+        }
+        if (videoSession && !videoPublisher)
+            gateway->sendMediaSinkWants({{"any", 100}});
     }
     emit clientConnected(data);
 }
@@ -554,10 +765,13 @@ void VoiceClient::onClientDisconnect(Core::Snowflake uid)
     if (daveSession)
         daveSession->removeConnectedUser(uidStr);
 
-    for (auto it = ssrcToUserIdMap.begin(); it != ssrcToUserIdMap.end(); ++it) {
+    for (auto it = ssrcToUserIdMap.begin(); it != ssrcToUserIdMap.end();) {
         if (it.value() == static_cast<quint64>(uid)) {
-            ssrcToUserIdMap.erase(it);
-            break;
+            videoAssemblers.remove(it.key());
+            rtxToVideoSsrc.remove(it.key());
+            it = ssrcToUserIdMap.erase(it);
+        } else {
+            ++it;
         }
     }
 
@@ -613,8 +827,10 @@ void VoiceClient::ensureDaveSession(uint16_t protocolVersion)
 
     qCInfo(LogVoice) << "Creating DAVE session, protocol version =" << protocolVersion;
 
-    daveSession = std::make_unique<DaveSession>(channelId, userId, ssrcToUserIdMap, this);
+    daveSession = std::make_unique<DaveSession>(videoSession ? daveGroupId : channelId, userId, ssrcToUserIdMap, this);
     daveSession->setLocalSsrc(localSsrc);
+    if (videoSession)
+        daveSession->setVideoSsrc(localVideoSsrc);
 
     for (const auto &uid : connectedUserIds)
         daveSession->addConnectedUser(uid);

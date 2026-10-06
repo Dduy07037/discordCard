@@ -131,6 +131,7 @@ public:
     void ackMessage(Snowflake channelId, Snowflake messageId, int flags, int lastViewed);
     void ackBulk(const QList<AckEntry> &entries);
 
+    void sendStreamRequest(int opcode, const QJsonObject &data);
     void sendVoiceStateUpdate(Snowflake guildId, Snowflake channelId, bool selfMute, bool selfDeaf);
 
     void leaveGuild(Snowflake guildId);
@@ -207,6 +208,7 @@ signals:
     void presenceUpdated(const PresenceUpdate &event);
     void voiceStateUpdated(const VoiceState &event);
     void voiceServerUpdated(const VoiceServerUpdate &event);
+    void streamEventReceived(const QString &event, const QJsonObject &data);
     void relationshipAdded(const Relationship &event);
     void relationshipUpdated(const RelationshipPartial &event);
     void relationshipRemoved(const RelationshipPartial &event);

@@ -265,9 +265,11 @@ if(ENABLE_VOICE)
         src/Discord/Voice/Socks5UdpAssociation.cpp
         src/Discord/Voice/VoiceClient.cpp
         src/Discord/Voice/RtpPacket.cpp
+        src/Discord/Voice/Vp8Rtp.cpp
         src/Discord/Voice/VoiceEncryption.cpp
         src/Discord/Voice/DaveSession.cpp
         src/Core/Audio/VoiceManager.cpp
+        src/Core/Audio/GoLiveSignaling.cpp
         src/Core/Audio/AudioPipeline.cpp
         src/Core/Audio/IAudioBackend.cpp
         src/Core/Audio/MiniaudioAudioBackend.cpp
@@ -277,6 +279,10 @@ if(ENABLE_VOICE)
         src/Core/Audio/AudioMixer.cpp
         src/Core/Audio/NoiseSuppressor.cpp
     )
+endif()
+
+if(ENABLE_VOICE AND TARGET ffmpeg)
+    list(APPEND PROJECT_SOURCES src/Core/Media/RealtimeVp8.cpp src/UI/GoLiveProbeDialog.cpp)
 endif()
 
 if(ENABLE_VOICE OR TARGET ffmpeg)
@@ -346,10 +352,32 @@ if(BUILD_TESTS)
         qt_add_executable(TestVoice tests/tst_Voice.cpp
             src/Core/Snowflake.cpp src/Core/Logging.cpp
             src/Core/Audio/JitterBuffer.cpp src/Core/Audio/OpusEncoder.cpp
-            src/Core/Audio/OpusDecoder.cpp)
+            src/Core/Audio/OpusDecoder.cpp src/Core/Audio/AudioPipeline.cpp
+            src/Core/Audio/AudioMixer.cpp src/Core/Audio/NoiseSuppressor.cpp
+            src/Core/Audio/IAudioBackend.hpp)
         target_link_libraries(TestVoice PRIVATE Qt::Core Qt::Test ${OPUS_TARGET} libdave)
         target_include_directories(TestVoice PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(ENABLE_RNNOISE)
+            target_link_libraries(TestVoice PRIVATE rnnoise)
+            target_compile_definitions(TestVoice PRIVATE ACHERON_HAVE_RNNOISE)
+        endif()
         add_test(NAME VoiceTests COMMAND TestVoice)
+
+        qt_add_executable(TestGoLiveSignaling tests/tst_GoLiveSignaling.cpp
+            src/Core/Snowflake.cpp src/Core/Audio/GoLiveSignaling.cpp)
+        target_link_libraries(TestGoLiveSignaling PRIVATE Qt::Core Qt::Test)
+        target_include_directories(TestGoLiveSignaling PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME GoLiveSignalingTests COMMAND TestGoLiveSignaling)
+
+        qt_add_executable(TestVp8Rtp tests/tst_Vp8Rtp.cpp src/Discord/Voice/Vp8Rtp.cpp)
+        target_link_libraries(TestVp8Rtp PRIVATE Qt::Core Qt::Gui Qt::Test libdave MLSPP::mlspp)
+        target_include_directories(TestVp8Rtp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(TARGET ffmpeg)
+            target_sources(TestVp8Rtp PRIVATE src/Core/Media/RealtimeVp8.cpp)
+            target_link_libraries(TestVp8Rtp PRIVATE ffmpeg)
+            target_compile_definitions(TestVp8Rtp PRIVATE TEST_VP8_CODEC)
+        endif()
+        add_test(NAME Vp8RtpTests COMMAND TestVp8Rtp)
     endif()
 endif()
 
@@ -368,7 +396,7 @@ if (MSVC)
     if(BUILD_TESTS)
         set(ACHERON_TEST_TARGETS TestMarkdown TestUnicodeEmoji TestFrecency TestProto TestProxy TestActivitySummary)
         if(ENABLE_VOICE)
-            list(APPEND ACHERON_TEST_TARGETS TestVoice)
+            list(APPEND ACHERON_TEST_TARGETS TestVoice TestGoLiveSignaling TestVp8Rtp)
         endif()
         foreach(test_target IN LISTS ACHERON_TEST_TARGETS)
             target_link_options(${test_target} PRIVATE $<$<CONFIG:Debug>:/INCREMENTAL>)

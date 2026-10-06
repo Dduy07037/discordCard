@@ -16,6 +16,7 @@
 #include "Core/ProxyConfig.hpp"
 #include "Core/Snowflake.hpp"
 #include "Core/Audio/IAudioBackend.hpp"
+#include "GoLiveSignaling.hpp"
 #include "Discord/Events.hpp"
 #include "Discord/Voice/VoiceClient.hpp"
 
@@ -42,6 +43,8 @@ class VoiceManager : public QObject
 public:
     explicit VoiceManager(Snowflake accountId, const ProxyConfig &proxy, QObject *parent = nullptr);
     ~VoiceManager() override;
+    GoLiveSignaling *goLive() const { return streamSignaling; }
+    const ProxyConfig &proxyConfig() const { return proxy; }
 
     void handleVoiceStateUpdate(const Discord::VoiceState &state);
     void handleVoiceServerUpdate(const Discord::VoiceServerUpdate &event);
@@ -98,6 +101,7 @@ public:
     void requestVerificationCode(Snowflake targetUserId, std::function<void(const QString &)> callback);
 
 signals:
+    void diagnosticsUpdated(const QJsonObject &stats);
     void voiceConnected();
     void voiceDisconnected();
     void voiceStateChanged();
@@ -127,6 +131,7 @@ private:
     void populateParticipantsFromCache();
 
 private:
+    GoLiveSignaling *streamSignaling = nullptr;
     Snowflake accountId;
     ProxyConfig proxy;
 
@@ -170,6 +175,7 @@ private:
     QSet<Snowflake> mutedUsers;
     QHash<Snowflake, Discord::VoiceState> knownVoiceStates;
     QString cachedPrivacyCode;
+    QJsonObject cachedDiagnostics;
 
     QThread *voiceThread = nullptr;
     QThread *audioThread = nullptr;
