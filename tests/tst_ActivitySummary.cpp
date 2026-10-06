@@ -152,5 +152,5 @@ void TestActivitySummary::parsesLivePresenceUpdate()
     QCOMPARE(update.activity.text, QStringLiteral("Listening to Spotify"));
 }
 
-QTEST_MAIN(TestActivitySummary)
+QTEST_GUILESS_MAIN(TestActivitySummary)
 #include "tst_ActivitySummary.moc"
